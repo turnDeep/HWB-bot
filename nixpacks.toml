@@ -2,10 +2,15 @@
 # This file is optional but can help with build optimization
 
 [phases.setup]
-nixPkgs = ["python311Full", "gcc", "libffi", "openssl"]
+nixPkgs = ["python311", "curl", "gcc", "libffi", "openssl"]
 
 [phases.install]
-cmds = ["python -m pip install --upgrade pip", "python -m pip install -r requirements.txt"]
+cmds = [
+    "curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py",
+    "python get-pip.py",
+    "python -m pip install --upgrade pip",
+    "python -m pip install -r requirements.txt"
+]
 
 [start]
 cmd = "python bot_hwb.py"
