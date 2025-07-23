@@ -10,8 +10,5 @@ cmds = [
     "venv/bin/python -m pip install -r requirements.txt"
 ]
 
-[start]
-cmd = "venv/bin/python bot_hwb.py"
-
 [variables]
 PYTHONUNBUFFERED = "1"
