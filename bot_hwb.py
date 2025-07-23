@@ -20,6 +20,7 @@ import concurrent.futures
 from functools import lru_cache
 import pickle
 from typing import List, Dict, Set, Tuple, Optional
+import aiohttp
 warnings.filterwarnings("ignore")
 
 # .envファイルから環境変数を読み込み
@@ -56,8 +57,8 @@ POST_STRATEGY1_ALERTS = parse_bool_env("POST_STRATEGY1_ALERTS", False)  # デフ
 POST_STRATEGY2_ALERTS = parse_bool_env("POST_STRATEGY2_ALERTS", False)  # デフォルトOFF
 
 # 処理最適化パラメータ
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))  # 並列処理のバッチサイズ
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))  # 並列ワーカー数
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 20))  # 並列処理のバッチサイズを減らす
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))  # 並列ワーカー数を減らす
 CACHE_EXPIRY_HOURS = 12  # キャッシュ有効期限
 
 # グローバル変数
@@ -208,47 +209,83 @@ class HWBAnalyzer:
         return df_daily, df_weekly
     
     @staticmethod
-    def batch_check_rule1(symbols: List[str]) -> Dict[str, bool]:
-        """ルール①を複数銘柄に対してバッチチェック"""
+    def check_single_symbol_rule1(symbol: str) -> Tuple[str, bool]:
+        """単一銘柄のルール①チェック（同期版）"""
+        try:
+            cache_key = datetime.now().strftime("%Y%m%d")
+            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+            
+            if df_daily is None or df_weekly is None:
+                return symbol, False
+            
+            df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+            
+            # ルール①チェック
+            if 'Weekly_SMA200' not in df_daily.columns:
+                return symbol, False
+            
+            latest = df_daily.iloc[-1]
+            passed = (pd.notna(latest['Weekly_SMA200']) and 
+                     pd.notna(latest['Close']) and 
+                     latest['Close'] > latest['Weekly_SMA200'])
+            
+            return symbol, passed
+            
+        except Exception:
+            return symbol, False
+    
+    @staticmethod
+    async def batch_check_rule1_async(symbols: List[str]) -> Dict[str, bool]:
+        """ルール①を複数銘柄に対して非同期バッチチェック"""
         results = {}
         
-        def check_single_symbol(symbol):
-            try:
-                cache_key = datetime.now().strftime("%Y%m%d")
-                df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
-                
-                if df_daily is None or df_weekly is None:
-                    return symbol, False
-                
-                df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
-                
-                # ルール①チェック
-                if 'Weekly_SMA200' not in df_daily.columns:
-                    return symbol, False
-                
-                latest = df_daily.iloc[-1]
-                passed = (pd.notna(latest['Weekly_SMA200']) and 
-                         pd.notna(latest['Close']) and 
-                         latest['Close'] > latest['Weekly_SMA200'])
-                
-                return symbol, passed
-                
-            except Exception:
-                return symbol, False
+        # ThreadPoolExecutorを使って同期関数を非同期で実行
+        loop = asyncio.get_event_loop()
         
-        # 並列処理
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(check_single_symbol, symbol) for symbol in symbols]
+        # バッチサイズを小さくして処理
+        for i in range(0, len(symbols), BATCH_SIZE):
+            batch = symbols[i:i + BATCH_SIZE]
             
-            for future in concurrent.futures.as_completed(futures):
-                symbol, passed = future.result()
-                results[symbol] = passed
+            # 各バッチを並列処理
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    loop.run_in_executor(executor, HWBAnalyzer.check_single_symbol_rule1, symbol)
+                    for symbol in batch
+                ]
+                
+                # 結果を収集
+                batch_results = await asyncio.gather(*futures)
+                for symbol, passed in batch_results:
+                    results[symbol] = passed
+            
+            # イベントループに制御を返す
+            await asyncio.sleep(0.1)
+            
+            # 進捗表示
+            processed = min(i + BATCH_SIZE, len(symbols))
+            passed_count = sum(1 for p in results.values() if p)
+            print(f"  進捗: {processed}/{len(symbols)} ({passed_count}銘柄が通過)")
         
         return results
     
     @staticmethod
-    def check_remaining_rules(symbol: str) -> List[Dict]:
-        """ルール②③④をチェック（ルール①通過済みの銘柄のみ）"""
+    async def check_remaining_rules_async(symbol: str) -> List[Dict]:
+        """ルール②③④を非同期でチェック"""
+        loop = asyncio.get_event_loop()
+        
+        # ThreadPoolExecutorで同期関数を非同期実行
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            result = await loop.run_in_executor(
+                executor,
+                HWBAnalyzer._check_remaining_rules_sync,
+                symbol
+            )
+        
+        return result
+    
+    @staticmethod
+    def _check_remaining_rules_sync(symbol: str) -> List[Dict]:
+        """ルール②③④の同期版チェック（内部用）"""
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
         
@@ -662,7 +699,7 @@ async def setup_guild(guild):
         print(f"サーバー '{guild.name}' の設定完了。アラートチャンネル: #{alert_channel.name}")
 
 async def scan_all_symbols_optimized():
-    """最適化された全銘柄スキャン（ルール順フィルタリング）"""
+    """最適化された全銘柄スキャン（非同期版）"""
     alerts = []
     
     # すべての銘柄を取得
@@ -672,44 +709,34 @@ async def scan_all_symbols_optimized():
     print(f"スキャン開始: {datetime.now()} - {total}銘柄")
     print("ステップ1: ルール①（週足トレンド）をチェック中...")
     
-    # ステップ1: ルール①でフィルタリング（バッチ処理）
-    passed_rule1 = []
-    for i in range(0, len(all_symbols), BATCH_SIZE):
-        batch = all_symbols[i:i + BATCH_SIZE]
-        batch_results = HWBAnalyzer.batch_check_rule1(batch)
+    # ステップ1: ルール①でフィルタリング（非同期バッチ処理）
+    try:
+        rule1_results = await HWBAnalyzer.batch_check_rule1_async(all_symbols)
+        passed_rule1 = [symbol for symbol, passed in rule1_results.items() if passed]
         
-        for symbol, passed in batch_results.items():
-            if passed:
-                passed_rule1.append(symbol)
+        print(f"ルール①通過: {len(passed_rule1)}銘柄 ({len(passed_rule1)/total*100:.1f}%)")
         
-        print(f"  進捗: {min(i + BATCH_SIZE, total)}/{total} ({len(passed_rule1)}銘柄が通過)")
-    
-    print(f"ルール①通過: {len(passed_rule1)}銘柄 ({len(passed_rule1)/total*100:.1f}%)")
-    
-    if not passed_rule1:
-        print("ルール①を通過した銘柄がありません。")
-        return alerts
-    
-    # ステップ2: ルール②③④をチェック
-    print("ステップ2: ルール②③④をチェック中...")
-    processed = 0
-    
-    def check_remaining_rules_wrapper(symbol):
-        try:
-            return HWBAnalyzer.check_remaining_rules(symbol)
-        except Exception as e:
-            print(f"エラー ({symbol}): {e}")
-            return []
-    
-    # 並列処理でルール②③④をチェック
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(check_remaining_rules_wrapper, symbol): symbol 
-                  for symbol in passed_rule1}
+        if not passed_rule1:
+            print("ルール①を通過した銘柄がありません。")
+            return alerts
         
-        for future in concurrent.futures.as_completed(futures):
-            symbol = futures[future]
-            try:
-                results = future.result()
+        # ステップ2: ルール②③④をチェック（非同期）
+        print("ステップ2: ルール②③④をチェック中...")
+        processed = 0
+        
+        # バッチごとに非同期処理
+        for i in range(0, len(passed_rule1), BATCH_SIZE):
+            batch = passed_rule1[i:i + BATCH_SIZE]
+            
+            # 各銘柄を非同期でチェック
+            tasks = [HWBAnalyzer.check_remaining_rules_async(symbol) for symbol in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for symbol, results in zip(batch, batch_results):
+                if isinstance(results, Exception):
+                    print(f"エラー ({symbol}): {results}")
+                    continue
+                
                 if results:
                     for result in results:
                         # 重複チェック（24時間以内に同じアラートを送信しない）
@@ -730,11 +757,23 @@ async def scan_all_symbols_optimized():
                 processed += 1
                 if processed % 10 == 0:
                     print(f"  進捗: {processed}/{len(passed_rule1)} (シグナル: {len(alerts)}件)")
-                    
-            except Exception as e:
-                print(f"処理エラー ({symbol}): {e}")
+            
+            # バッチ間でイベントループに制御を返す
+            await asyncio.sleep(0.1)
+        
+        print(f"スキャン完了: {len(alerts)}件のシグナルを検出")
+        
+        # 統計情報を保存
+        scan_all_symbols_optimized.last_stats = {
+            'rule1_pass_rate': len(passed_rule1) / len(all_symbols) * 100 if all_symbols else 0,
+            'total_signals': len(alerts)
+        }
+        
+    except Exception as e:
+        print(f"スキャンエラー: {e}")
+        import traceback
+        traceback.print_exc()
     
-    print(f"スキャン完了: {len(alerts)}件のシグナルを検出")
     return alerts
 
 def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
@@ -952,14 +991,8 @@ async def daily_scan():
         # 全銘柄スキャン（最適化版）
         alerts = await scan_all_symbols_optimized()
         
-        # 処理統計を保存（サマリー表示には使用しないが、内部記録として保持）
+        # 処理統計を保存
         processing_time = (datetime.now() - start_time).total_seconds()
-        scan_all_symbols_optimized.last_stats = {
-            'rule1_pass_rate': len(passed_rule1) / len(watched_symbols) * 100 if watched_symbols else 0,
-            'processing_time': processing_time,
-            'total_signals': len(alerts)
-        }
-        
         print(f"処理完了: {processing_time:.1f}秒")
         
         # 各サーバーに投稿
@@ -1073,13 +1106,13 @@ async def check_symbol(ctx, symbol: str):
     
     try:
         # まずルール①をチェック
-        rule1_results = HWBAnalyzer.batch_check_rule1([symbol])
+        rule1_results = await HWBAnalyzer.batch_check_rule1_async([symbol])
         if not rule1_results.get(symbol, False):
             await ctx.send(f"{symbol} はルール①（週足トレンド）を満たしていません。")
             return
         
         # ルール②③④をチェック
-        results = HWBAnalyzer.check_remaining_rules(symbol)
+        results = await HWBAnalyzer.check_remaining_rules_async(symbol)
         
         if not results:
             await ctx.send(f"{symbol} はルール②以降の条件を満たしていません。")
