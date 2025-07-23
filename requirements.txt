@@ -1,0 +1,28 @@
+# Discord Bot
+discord.py>=2.3.0
+
+# 株価データ取得
+yfinance>=0.2.28
+lxml>=4.9.0
+curl_cffi>=0.6.1
+
+# データ分析
+pandas>=2.0.0
+numpy>=1.24.0
+
+# チャート作成
+matplotlib>=3.7.0
+mplfinance>=0.12.10b0
+Pillow>=10.0.0
+
+# 環境変数管理
+python-dotenv>=1.0.0
+
+# 非同期処理
+aiohttp>=3.8.0
+
+# タイムゾーン処理
+pytz>=2023.3
+
+# HTTPリクエスト
+requests>=2.31.0
