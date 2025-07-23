@@ -1,0 +1,17 @@
+# Nixpacks configuration for Railway
+
+[phases.setup]
+nixPkgs = ["python311", "gcc", "libffi", "openssl", "libxml2", "libxslt"]
+
+[phases.install]
+cmds = [
+    "python -m venv venv",
+    "venv/bin/python -m pip install --upgrade pip",
+    "venv/bin/python -m pip install -r requirements.txt"
+]
+
+[start]
+cmd = "venv/bin/python bot_hwb.py"
+
+[variables]
+PYTHONUNBUFFERED = "1"
