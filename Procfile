@@ -1,1 +1,1 @@
-worker: python bot_hwb.py
+worker: venv/bin/python bot_hwb.py
