@@ -1,1 +1,1 @@
-worker: PYTHONPATH=./libs python bot_hwb.py
+worker: python bot_hwb.py
