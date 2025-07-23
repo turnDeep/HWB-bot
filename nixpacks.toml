@@ -2,7 +2,7 @@
 # This file is optional but can help with build optimization
 
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "gcc", "libffi", "openssl"]
+nixPkgs = ["python311Full", "gcc", "libffi", "openssl"]
 
 [phases.install]
 cmds = ["python -m pip install --upgrade pip", "python -m pip install -r requirements.txt"]
