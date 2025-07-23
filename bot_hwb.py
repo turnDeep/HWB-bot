@@ -45,6 +45,16 @@ PROXIMITY_PERCENTAGE = 0.05  # ルール③条件Aの許容範囲（5%）
 FVG_ZONE_PROXIMITY = 0.10   # ルール③条件Bの許容範囲（10%）
 BREAKOUT_THRESHOLD = 0.001  # ブレイクアウトの閾値（0.1%）
 
+# 投稿設定
+def parse_bool_env(key: str, default: bool) -> bool:
+    """環境変数をboolに変換（エラーハンドリング付き）"""
+    value = os.getenv(key, str(default).lower())
+    return value.lower() in ['true', '1', 'yes', 'on']
+
+POST_SUMMARY = parse_bool_env("POST_SUMMARY", True)  # デフォルトON
+POST_STRATEGY1_ALERTS = parse_bool_env("POST_STRATEGY1_ALERTS", False)  # デフォルトOFF
+POST_STRATEGY2_ALERTS = parse_bool_env("POST_STRATEGY2_ALERTS", False)  # デフォルトOFF
+
 # 処理最適化パラメータ
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))  # 並列処理のバッチサイズ
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))  # 並列ワーカー数
@@ -729,87 +739,161 @@ async def scan_all_symbols_optimized():
 
 def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     """サマリーEmbed作成"""
-    fvg_count = len([a for a in alerts if a['signal_type'] == 's1_fvg_detected'])
-    breakout_count = len([a for a in alerts if a['signal_type'] == 's2_breakout'])
+    # 戦略1と戦略2のティッカーを分離
+    strategy1_tickers = [a['symbol'] for a in alerts if a['signal_type'] == 's1_fvg_detected']
+    strategy2_tickers = [a['symbol'] for a in alerts if a['signal_type'] == 's2_breakout']
     
     embed = discord.Embed(
-        title="📊 HWB戦略 スキャン結果サマリー (NASDAQ/NYSE)",
-        description=f"スキャン時刻: {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
+        title="AI判定システム",
+        description=f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
         color=discord.Color.gold()
     )
     
-    embed.add_field(name="🎯 対象銘柄数", value=f"{len(watched_symbols):,} 銘柄", inline=True)
-    embed.add_field(name="🔵 戦略1: FVG検出", value=f"{fvg_count} 銘柄", inline=True)
-    embed.add_field(name="🟢 戦略2: ブレイクアウト", value=f"{breakout_count} 銘柄", inline=True)
-    
-    # 検出銘柄リスト（最大20件）
-    if alerts:
-        symbols_list = [a['symbol'] for a in alerts[:20]]
-        symbols_str = ", ".join(symbols_list)
-        if len(alerts) > 20:
-            symbols_str += f" ... 他{len(alerts) - 20}件"
-        embed.add_field(name="📈 検出銘柄", value=symbols_str, inline=False)
-    
-    # 処理統計
-    if hasattr(scan_all_symbols_optimized, 'last_stats'):
-        stats = scan_all_symbols_optimized.last_stats
+    # 監視候補（戦略1）
+    if strategy1_tickers:
+        tickers_str = ', '.join(strategy1_tickers)
+        # Discordのフィールド値制限（1024文字）を考慮
+        if len(tickers_str) > 1000:
+            # 文字数制限を超える場合は省略
+            tickers_list = []
+            current_length = 0
+            for ticker in strategy1_tickers:
+                if current_length + len(ticker) + 2 < 980:  # カンマとスペースを考慮
+                    tickers_list.append(ticker)
+                    current_length += len(ticker) + 2
+                else:
+                    tickers_list.append(f"... 他{len(strategy1_tickers) - len(tickers_list)}銘柄")
+                    break
+            tickers_str = ', '.join(tickers_list)
+        
         embed.add_field(
-            name="📊 処理統計",
-            value=f"• ルール①通過率: {stats['rule1_pass_rate']:.1f}%\n"
-                  f"• 処理時間: {stats['processing_time']:.1f}秒",
+            name="📍 監視候補",
+            value=tickers_str,
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="📍 監視候補",
+            value="なし",
             inline=False
         )
     
-    embed.set_footer(text="HWB Strategy Scanner - NASDAQ/NYSE Technical Analysis")
+    # シグナル（戦略2）
+    if strategy2_tickers:
+        tickers_str = ', '.join(strategy2_tickers)
+        # Discordのフィールド値制限（1024文字）を考慮
+        if len(tickers_str) > 1000:
+            # 文字数制限を超える場合は省略
+            tickers_list = []
+            current_length = 0
+            for ticker in strategy2_tickers:
+                if current_length + len(ticker) + 2 < 980:  # カンマとスペースを考慮
+                    tickers_list.append(ticker)
+                    current_length += len(ticker) + 2
+                else:
+                    tickers_list.append(f"... 他{len(strategy2_tickers) - len(tickers_list)}銘柄")
+                    break
+            tickers_str = ', '.join(tickers_list)
+        
+        embed.add_field(
+            name="🚀 シグナル",
+            value=tickers_str,
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="🚀 シグナル",
+            value="なし",
+            inline=False
+        )
+    
+    embed.set_footer(text="AI Trading Analysis System")
     
     return embed
 
 async def post_alerts(channel, alerts: List[Dict]):
     """アラートを投稿"""
-    if not alerts:
-        # シグナルがない場合もサマリーは投稿
-        no_signal_embed = discord.Embed(
-            title="📊 HWB戦略 スキャン完了",
-            description="本日はシグナルが検出されませんでした。",
-            color=discord.Color.grey(),
-            timestamp=datetime.now()
-        )
-        no_signal_embed.add_field(
-            name="対象銘柄数",
-            value=f"{len(watched_symbols):,} 銘柄",
-            inline=True
-        )
-        await channel.send(embed=no_signal_embed)
-        return
-    
-    # サマリーを投稿
-    summary_embed = create_summary_embed(alerts)
-    await channel.send(embed=summary_embed)
-    
-    # 個別アラート（最大30件に増やす）
-    for alert in alerts[:30]:
-        try:
-            if alert['signal_type'] == 's1_fvg_detected':
-                embed = create_hwb_fvg_alert_embed(alert)
-            else:  # s2_breakout
-                embed = create_hwb_breakout_alert_embed(alert)
-            
-            # チャート作成
-            chart = HWBAnalyzer.create_hwb_chart(
-                alert['symbol'], 
-                setup_date=alert['setup']['date'],
-                fvg_info=alert['fvg']
+    # サマリーの投稿（POST_SUMMARYがTrueの場合）
+    if POST_SUMMARY:
+        if not alerts:
+            # シグナルがない場合のサマリー
+            no_signal_embed = discord.Embed(
+                title="AI判定システム",
+                description=f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
+                color=discord.Color.grey(),
+                timestamp=datetime.now()
             )
+            no_signal_embed.add_field(name="📍 監視候補", value="なし", inline=False)
+            no_signal_embed.add_field(name="🚀 シグナル", value="なし", inline=False)
+            no_signal_embed.set_footer(text="AI Trading Analysis System")
+            await channel.send(embed=no_signal_embed)
+        else:
+            # シグナルがある場合のサマリー
+            summary_embed = create_summary_embed(alerts)
+            await channel.send(embed=summary_embed)
+    
+    # 個別アラートの投稿（該当する設定がONの場合のみ）
+    if POST_STRATEGY1_ALERTS or POST_STRATEGY2_ALERTS:
+        posted_count = 0
+        max_individual_alerts = 30
+        
+        for alert in alerts:
+            # 投稿上限チェック
+            if posted_count >= max_individual_alerts:
+                break
             
-            if chart:
-                file = discord.File(chart, filename=f"{alert['symbol']}_hwb_chart.png")
-                embed.set_image(url=f"attachment://{alert['symbol']}_hwb_chart.png")
-                await channel.send(embed=embed, file=file)
-            else:
-                await channel.send(embed=embed)
-                
-        except Exception as e:
-            print(f"アラート送信エラー ({alert['symbol']}): {e}")
+            # 戦略1アラート（FVG検出）
+            if alert['signal_type'] == 's1_fvg_detected' and POST_STRATEGY1_ALERTS:
+                try:
+                    embed = create_hwb_fvg_alert_embed(alert)
+                    
+                    # チャート作成
+                    chart = HWBAnalyzer.create_hwb_chart(
+                        alert['symbol'], 
+                        setup_date=alert['setup']['date'],
+                        fvg_info=alert['fvg']
+                    )
+                    
+                    if chart:
+                        file = discord.File(chart, filename=f"{alert['symbol']}_hwb_chart.png")
+                        embed.set_image(url=f"attachment://{alert['symbol']}_hwb_chart.png")
+                        await channel.send(embed=embed, file=file)
+                    else:
+                        await channel.send(embed=embed)
+                    
+                    posted_count += 1
+                    
+                except Exception as e:
+                    print(f"戦略1アラート送信エラー ({alert['symbol']}): {e}")
+            
+            # 戦略2アラート（ブレイクアウト）
+            elif alert['signal_type'] == 's2_breakout' and POST_STRATEGY2_ALERTS:
+                try:
+                    embed = create_hwb_breakout_alert_embed(alert)
+                    
+                    # チャート作成
+                    chart = HWBAnalyzer.create_hwb_chart(
+                        alert['symbol'],
+                        setup_date=alert['setup']['date'],
+                        fvg_info=alert['fvg']
+                    )
+                    
+                    if chart:
+                        file = discord.File(chart, filename=f"{alert['symbol']}_hwb_chart.png")
+                        embed.set_image(url=f"attachment://{alert['symbol']}_hwb_chart.png")
+                        await channel.send(embed=embed, file=file)
+                    else:
+                        await channel.send(embed=embed)
+                    
+                    posted_count += 1
+                    
+                except Exception as e:
+                    print(f"戦略2アラート送信エラー ({alert['symbol']}): {e}")
+        
+        # 投稿上限に達した場合の通知
+        if posted_count >= max_individual_alerts and len(alerts) > max_individual_alerts:
+            remaining = len(alerts) - max_individual_alerts
+            await channel.send(f"📋 他に{remaining}件のアラートがありますが、投稿上限に達しました。")
 
 # Bot イベント
 @bot.event
@@ -818,6 +902,12 @@ async def on_ready():
     watched_symbols = get_nasdaq_nyse_symbols()
     print(f"{bot.user} がログインしました！")
     print(f"監視銘柄数: {len(watched_symbols):,}")
+    
+    # 投稿設定を表示
+    print("\n投稿設定:")
+    print(f"  サマリー: {'ON' if POST_SUMMARY else 'OFF'}")
+    print(f"  戦略1アラート: {'ON' if POST_STRATEGY1_ALERTS else 'OFF'}")
+    print(f"  戦略2アラート: {'ON' if POST_STRATEGY2_ALERTS else 'OFF'}")
     
     # キャッシュディレクトリを作成
     os.makedirs("cache", exist_ok=True)
@@ -862,11 +952,12 @@ async def daily_scan():
         # 全銘柄スキャン（最適化版）
         alerts = await scan_all_symbols_optimized()
         
-        # 処理統計を保存
+        # 処理統計を保存（サマリー表示には使用しないが、内部記録として保持）
         processing_time = (datetime.now() - start_time).total_seconds()
         scan_all_symbols_optimized.last_stats = {
-            'rule1_pass_rate': len(alerts) / len(watched_symbols) * 100 if watched_symbols else 0,
-            'processing_time': processing_time
+            'rule1_pass_rate': len(passed_rule1) / len(watched_symbols) * 100 if watched_symbols else 0,
+            'processing_time': processing_time,
+            'total_signals': len(alerts)
         }
         
         print(f"処理完了: {processing_time:.1f}秒")
@@ -922,6 +1013,18 @@ async def bot_status(ctx):
     embed.add_field(
         name="監視対象",
         value=f"NASDAQ/NYSE\n{len(watched_symbols):,} 銘柄",
+        inline=True
+    )
+    
+    # 投稿設定
+    post_settings = []
+    post_settings.append(f"サマリー: {'✅' if POST_SUMMARY else '❌'}")
+    post_settings.append(f"戦略1: {'✅' if POST_STRATEGY1_ALERTS else '❌'}")
+    post_settings.append(f"戦略2: {'✅' if POST_STRATEGY2_ALERTS else '❌'}")
+    
+    embed.add_field(
+        name="投稿設定",
+        value="\n".join(post_settings),
         inline=True
     )
     
@@ -982,6 +1085,9 @@ async def check_symbol(ctx, symbol: str):
             await ctx.send(f"{symbol} はルール②以降の条件を満たしていません。")
             return
         
+        # 個別チェックの場合は常に結果を表示（投稿設定に関係なく）
+        await ctx.send(f"✅ {symbol} は以下の条件を満たしています：")
+        
         for result in results:
             if result['signal_type'] == 's1_fvg_detected':
                 embed = create_hwb_fvg_alert_embed(result)
@@ -1013,6 +1119,45 @@ async def clear_cache(ctx):
     cache_size = len(data_cache)
     data_cache.clear()
     await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
+
+@bot.command(name="toggle")
+@commands.has_permissions(administrator=True)
+async def toggle_alerts(ctx, alert_type: str = None):
+    """投稿設定を切り替え（管理者のみ）"""
+    global POST_SUMMARY, POST_STRATEGY1_ALERTS, POST_STRATEGY2_ALERTS
+    
+    if alert_type is None:
+        # 現在の設定を表示
+        embed = discord.Embed(
+            title="📮 投稿設定",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="サマリー", value="✅ ON" if POST_SUMMARY else "❌ OFF", inline=True)
+        embed.add_field(name="戦略1アラート", value="✅ ON" if POST_STRATEGY1_ALERTS else "❌ OFF", inline=True)
+        embed.add_field(name="戦略2アラート", value="✅ ON" if POST_STRATEGY2_ALERTS else "❌ OFF", inline=True)
+        embed.add_field(
+            name="使用方法",
+            value="`!toggle summary` - サマリー投稿の切り替え\n"
+                  "`!toggle s1` - 戦略1アラートの切り替え\n"
+                  "`!toggle s2` - 戦略2アラートの切り替え",
+            inline=False
+        )
+        await ctx.send(embed=embed)
+        return
+    
+    alert_type = alert_type.lower()
+    
+    if alert_type in ["summary", "sum"]:
+        POST_SUMMARY = not POST_SUMMARY
+        await ctx.send(f"✅ サマリー投稿を{'ON' if POST_SUMMARY else 'OFF'}にしました")
+    elif alert_type in ["s1", "strategy1", "1"]:
+        POST_STRATEGY1_ALERTS = not POST_STRATEGY1_ALERTS
+        await ctx.send(f"✅ 戦略1アラートを{'ON' if POST_STRATEGY1_ALERTS else 'OFF'}にしました")
+    elif alert_type in ["s2", "strategy2", "2"]:
+        POST_STRATEGY2_ALERTS = not POST_STRATEGY2_ALERTS
+        await ctx.send(f"✅ 戦略2アラートを{'ON' if POST_STRATEGY2_ALERTS else 'OFF'}にしました")
+    else:
+        await ctx.send("❌ 無効なタイプです。`summary`, `s1`, `s2` のいずれかを指定してください。")
 
 # メイン実行
 if __name__ == "__main__":
