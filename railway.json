@@ -1,0 +1,24 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "startCommand": "python bot_hwb.py",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "healthcheckPath": null,
+    "healthcheckTimeout": 300
+  },
+  "services": [
+    {
+      "name": "hwb-discord-bot",
+      "icon": "discord",
+      "source": {
+        "repo": "github.com/yourusername/hwb-discord-bot"
+      }
+    }
+  ]
+}
