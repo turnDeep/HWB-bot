@@ -42,9 +42,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 BOT_CHANNEL_NAME = os.getenv("BOT_CHANNEL_NAME", "hwb-signal-alerts")
 
 # HWB戦略のパラメータ
-PROXIMITY_PERCENTAGE = 0.05  # ルール③条件Aの許容範囲（5%）
-FVG_ZONE_PROXIMITY = 0.10   # ルール③条件Bの許容範囲（10%）
-BREAKOUT_THRESHOLD = 0.001  # ブレイクアウトの閾値（0.1%）
+PROXIMITY_PERCENTAGE = float(os.getenv("PROXIMITY_PERCENTAGE", 0.05))
+FVG_ZONE_PROXIMITY = float(os.getenv("FVG_ZONE_PROXIMITY", 0.10))
+BREAKOUT_THRESHOLD = float(os.getenv("BREAKOUT_THRESHOLD", 0.001))
+SETUP_LOOKBACK_DAYS = int(os.getenv("SETUP_LOOKBACK_DAYS", 60))
 
 # 投稿設定
 def parse_bool_env(key: str, default: bool) -> bool:
@@ -52,14 +53,14 @@ def parse_bool_env(key: str, default: bool) -> bool:
     value = os.getenv(key, str(default).lower())
     return value.lower() in ['true', '1', 'yes', 'on']
 
-POST_SUMMARY = parse_bool_env("POST_SUMMARY", True)  # デフォルトON
-POST_STRATEGY1_ALERTS = parse_bool_env("POST_STRATEGY1_ALERTS", False)  # デフォルトOFF
-POST_STRATEGY2_ALERTS = parse_bool_env("POST_STRATEGY2_ALERTS", False)  # デフォルトOFF
+POST_SUMMARY = parse_bool_env("POST_SUMMARY", True)
+POST_STRATEGY1_ALERTS = parse_bool_env("POST_STRATEGY1_ALERTS", False)
+POST_STRATEGY2_ALERTS = parse_bool_env("POST_STRATEGY2_ALERTS", False)
 
 # 処理最適化パラメータ
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 20))  # 並列処理のバッチサイズを減らす
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))  # 並列ワーカー数を減らす
-CACHE_EXPIRY_HOURS = 12  # キャッシュ有効期限
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 20))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
+CACHE_EXPIRY_HOURS = 12
 
 # グローバル変数
 watched_symbols = set()
@@ -67,7 +68,8 @@ setup_alerts = {}
 fvg_alerts = {}
 breakout_alerts = {}
 server_configs = {}
-data_cache = {}  # 銘柄データのキャッシュ
+data_cache = {}
+signal_history = {}  # シグナル履歴を記録
 
 # タイムゾーン設定
 ET = pytz.timezone("US/Eastern")
@@ -195,17 +197,26 @@ class HWBAnalyzer:
         # 週足200SMA
         df_weekly['SMA200'] = df_weekly['Close'].rolling(window=200, min_periods=200).mean()
         
-        # 週足SMAを日足データに結合
+        # 週足SMAを日足データに結合（改善版）
         df_daily['Weekly_SMA200'] = np.nan
+        df_daily['Weekly_Close'] = np.nan
+        
         for idx, row in df_weekly.iterrows():
             if pd.notna(row['SMA200']):
+                # 週の開始日（月曜日）と終了日（金曜日）を計算
                 week_start = idx - pd.Timedelta(days=idx.weekday())
-                week_end = week_start + pd.Timedelta(days=6)
+                week_end = week_start + pd.Timedelta(days=4)  # 金曜日まで
+                
+                # その週の日足データに週足情報を適用
                 mask = (df_daily.index >= week_start) & (df_daily.index <= week_end)
                 if mask.any():
                     df_daily.loc[mask, 'Weekly_SMA200'] = row['SMA200']
+                    df_daily.loc[mask, 'Weekly_Close'] = row['Close']
         
+        # 前方補完（週末や祝日のデータのため）
         df_daily['Weekly_SMA200'] = df_daily['Weekly_SMA200'].ffill()
+        df_daily['Weekly_Close'] = df_daily['Weekly_Close'].ffill()
+        
         return df_daily, df_weekly
     
     @staticmethod
@@ -218,21 +229,74 @@ class HWBAnalyzer:
             if df_daily is None or df_weekly is None:
                 return symbol, False
             
-            df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+            df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
             
-            # ルール①チェック
-            if 'Weekly_SMA200' not in df_daily.columns:
+            # ルール①チェック（改善版）
+            if 'Weekly_SMA200' not in df_daily.columns or 'Weekly_Close' not in df_daily.columns:
                 return symbol, False
             
+            # 最新の週足データを確認
             latest = df_daily.iloc[-1]
+            
+            # 週足終値が週足200SMAを上回っているかチェック
             passed = (pd.notna(latest['Weekly_SMA200']) and 
-                     pd.notna(latest['Close']) and 
-                     latest['Close'] > latest['Weekly_SMA200'])
+                     pd.notna(latest['Weekly_Close']) and 
+                     latest['Weekly_Close'] > latest['Weekly_SMA200'])
+            
+            # デバッグ情報
+            if symbol in ["AAPL", "NVDA", "TSLA"]:  # デバッグ用
+                print(f"{symbol} - Weekly Close: {latest.get('Weekly_Close', 'N/A'):.2f}, "
+                      f"Weekly SMA200: {latest.get('Weekly_SMA200', 'N/A'):.2f}, "
+                      f"Passed: {passed}")
             
             return symbol, passed
             
-        except Exception:
+        except Exception as e:
+            print(f"ルール①チェックエラー ({symbol}): {e}")
             return symbol, False
+    
+    @staticmethod
+    def has_recent_signal(symbol: str, lookback_days: int) -> bool:
+        """指定期間内にシグナルを出したことがあるかチェック"""
+        if symbol not in signal_history:
+            # 履歴がない場合は、データから直接チェック
+            cache_key = datetime.now().strftime("%Y%m%d")
+            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+            
+            if df_daily is None or df_weekly is None:
+                return False
+            
+            df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+            
+            # 過去のシグナルをチェック
+            last_signal_setup_date = HWBAnalyzer.check_historical_signals(symbol, df_daily)
+            if last_signal_setup_date:
+                # 履歴に記録
+                HWBAnalyzer.update_signal_history(symbol, last_signal_setup_date)
+                
+                # 最後のシグナルからの経過日数をチェック
+                days_since_signal = (datetime.now().date() - last_signal_setup_date.date()).days
+                return days_since_signal <= lookback_days
+            
+            return False
+        
+        last_signal_date = signal_history[symbol].get('last_signal_date')
+        if not last_signal_date:
+            return False
+        
+        # 最後のシグナルからの経過日数
+        days_since_signal = (datetime.now() - last_signal_date).days
+        
+        # lookback_days期間内にシグナルがある場合はTrue
+        return days_since_signal <= lookback_days
+    
+    @staticmethod
+    def update_signal_history(symbol: str, setup_date: pd.Timestamp):
+        """シグナル履歴を更新"""
+        signal_history[symbol] = {
+            'last_signal_date': datetime.now(),
+            'last_setup_date': setup_date
+        }
     
     @staticmethod
     async def batch_check_rule1_async(symbols: List[str]) -> Dict[str, bool]:
@@ -269,8 +333,12 @@ class HWBAnalyzer:
         return results
     
     @staticmethod
-    async def check_remaining_rules_async(symbol: str) -> List[Dict]:
+    async def check_remaining_rules_async(symbol: str, check_history: bool = True) -> List[Dict]:
         """ルール②③④を非同期でチェック"""
+        # シグナル履歴チェック
+        if check_history and HWBAnalyzer.has_recent_signal(symbol, SETUP_LOOKBACK_DAYS):
+            return []
+        
         loop = asyncio.get_event_loop()
         
         # ThreadPoolExecutorで同期関数を非同期実行
@@ -278,13 +346,40 @@ class HWBAnalyzer:
             result = await loop.run_in_executor(
                 executor,
                 HWBAnalyzer._check_remaining_rules_sync,
-                symbol
+                symbol,
+                check_history
             )
         
         return result
     
     @staticmethod
-    def _check_remaining_rules_sync(symbol: str) -> List[Dict]:
+    def check_historical_signals(symbol: str, df_daily: pd.DataFrame) -> Optional[pd.Timestamp]:
+        """過去のシグナル（ルール④達成）をチェックして、最新のセットアップ日を返す"""
+        # 過去のセットアップをすべて検出
+        all_setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
+        if not all_setups:
+            return None
+        
+        # 新しい順にソート
+        all_setups.sort(key=lambda x: x['date'], reverse=True)
+        
+        # 各セットアップに対してルール③④をチェック
+        for setup in all_setups:
+            # FVG検出
+            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup['date'])
+            
+            for fvg in fvgs:
+                # ブレイクアウトチェック
+                breakout = HWBAnalyzer.check_breakout(df_daily, setup, fvg)
+                
+                if breakout:
+                    # ブレイクアウトが発生している = 過去にシグナルを出した
+                    return setup['date']
+        
+        return None
+    
+    @staticmethod
+    def _check_remaining_rules_sync(symbol: str, check_history: bool = True) -> List[Dict]:
         """ルール②③④の同期版チェック（内部用）"""
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
@@ -294,12 +389,30 @@ class HWBAnalyzer:
         
         df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
         
+        # 履歴チェックが有効な場合、過去のシグナルをチェック
+        last_signal_setup_date = None
+        if check_history:
+            # シグナル履歴がない場合は、過去データから検出
+            if symbol not in signal_history:
+                last_signal_setup_date = HWBAnalyzer.check_historical_signals(symbol, df_daily)
+                if last_signal_setup_date:
+                    # 履歴に記録
+                    HWBAnalyzer.update_signal_history(symbol, last_signal_setup_date)
+            else:
+                last_signal_setup_date = signal_history[symbol].get('last_setup_date')
+        
         # ルール②セットアップを探す
-        setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=60)
+        setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
         if not setups:
             return []
         
         results = []
+        
+        # 過去のシグナルがある場合、それより新しいセットアップのみを対象とする
+        if check_history and last_signal_setup_date:
+            setups = [s for s in setups if s['date'] > last_signal_setup_date]
+            if not setups:
+                return []  # 新しいセットアップがない
         
         for setup in setups:
             # ルール③FVG検出
@@ -324,6 +437,10 @@ class HWBAnalyzer:
                     if breakout:  # ブレイクアウトも発生（戦略2）
                         result['signal_type'] = 's2_breakout'
                         result['breakout'] = breakout
+                        
+                        # シグナル履歴を更新
+                        if check_history:
+                            HWBAnalyzer.update_signal_history(symbol, setup['date'])
                     
                     results.append(result)
         
@@ -344,8 +461,8 @@ class HWBAnalyzer:
             if (zone_lower <= row['Open'] <= zone_upper and 
                 zone_lower <= row['Close'] <= zone_upper):
                 
-                # ルール①の確認（既にチェック済みだが念のため）
-                if pd.notna(row.get('Weekly_SMA200')) and row['Close'] > row['Weekly_SMA200']:
+                # ルール①の再確認（週足終値 > 週足200SMA）
+                if pd.notna(row.get('Weekly_Close')) and pd.notna(row.get('Weekly_SMA200')) and row['Weekly_Close'] > row['Weekly_SMA200']:
                     setups.append({
                         'date': valid_data.index[i],
                         'open': row['Open'],
@@ -466,8 +583,8 @@ class HWBAnalyzer:
         return None
     
     @staticmethod
-    def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, save_path: str = None) -> Optional[BytesIO]:
-        """HWB戦略のチャートを作成"""
+    def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, save_path: str = None, show_zones: bool = True) -> Optional[BytesIO]:
+        """HWB戦略のチャートを作成（ゾーン表示オプション付き）"""
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
         
@@ -477,7 +594,7 @@ class HWBAnalyzer:
         df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
         
         # チャート表示期間を設定
-        if setup_date:
+        if setup_date and show_zones:
             center_date = pd.to_datetime(setup_date)
             start_date = center_date - pd.Timedelta(days=90)
             end_date = center_date + pd.Timedelta(days=90)
@@ -504,28 +621,34 @@ class HWBAnalyzer:
         if 'EMA200' in df_plot.columns and not df_plot['EMA200'].isna().all():
             apds.append(mpf.make_addplot(df_plot['EMA200'], color='purple', width=2))
         
+        # 週足SMA200（青色、太い線）
+        if 'Weekly_SMA200' in df_plot.columns and not df_plot['Weekly_SMA200'].isna().all():
+            apds.append(mpf.make_addplot(df_plot['Weekly_SMA200'], color='blue', width=3))
+        
         fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, addplot=apds,
                              title=f'{symbol} - HWB Strategy Analysis', returnfig=True, 
                              figsize=(12, 8), panel_ratios=(3, 1))
         
         ax = axes[0]
         
-        # セットアップゾーンをハイライト
-        if setup_date and setup_date in df_plot.index:
-            setup_idx = df_plot.index.get_loc(setup_date)
-            ax.axvspan(setup_idx - 0.5, setup_idx + 0.5, alpha=0.3, color='yellow', zorder=0)
-        
-        # FVGを描画
-        if fvg_info and fvg_info['start_date'] in df_plot.index:
-            start_idx = df_plot.index.get_loc(fvg_info['start_date'])
-            rect = patches.Rectangle((start_idx - 0.5, fvg_info['lower_bound']), 
-                                     len(df_plot) - start_idx, 
-                                     fvg_info['upper_bound'] - fvg_info['lower_bound'],
-                                     linewidth=1, edgecolor='green', facecolor='green', alpha=0.2)
-            ax.add_patch(rect)
+        # ゾーンを表示する場合のみ
+        if show_zones:
+            # セットアップゾーンをハイライト
+            if setup_date and setup_date in df_plot.index:
+                setup_idx = df_plot.index.get_loc(setup_date)
+                ax.axvspan(setup_idx - 0.5, setup_idx + 0.5, alpha=0.3, color='yellow', zorder=0)
+            
+            # FVGを描画
+            if fvg_info and fvg_info['start_date'] in df_plot.index:
+                start_idx = df_plot.index.get_loc(fvg_info['start_date'])
+                rect = patches.Rectangle((start_idx - 0.5, fvg_info['lower_bound']), 
+                                         len(df_plot) - start_idx, 
+                                         fvg_info['upper_bound'] - fvg_info['lower_bound'],
+                                         linewidth=1, edgecolor='green', facecolor='green', alpha=0.2)
+                ax.add_patch(rect)
         
         # 凡例
-        ax.legend(['Daily SMA200', 'Daily EMA200'], loc='upper left')
+        ax.legend(['Daily SMA200', 'Daily EMA200', 'Weekly SMA200'], loc='upper left')
         
         if save_path:
             plt.savefig(save_path)
@@ -538,137 +661,34 @@ class HWBAnalyzer:
             plt.close()
             return buf
 
-# Embed作成関数（変更なし）
-def create_hwb_fvg_alert_embed(result: Dict) -> discord.Embed:
-    """戦略1（ルール③: FVG検出）のアラート用Embed"""
-    symbol = result["symbol"]
-    setup = result["setup"]
-    fvg = result["fvg"]
-    
-    try:
-        company_name = yf.Ticker(symbol).info.get("longName", symbol)
-    except:
-        company_name = symbol
-    
+# Embed作成関数（簡略化版）
+def create_simple_s1_embed(symbol: str, alerts: List[Dict]) -> discord.Embed:
+    """戦略1の簡略化されたEmbed（複数FVGをまとめる）"""
     embed = discord.Embed(
-        title=f"📈 HWB戦略1: FVG形成検出 - {symbol}",
-        description=f"**{company_name}** でセットアップ後のFVGを検出しました。",
-        color=discord.Color.blue(),
-        timestamp=datetime.now()
+        title=f"📍監視候補 - {symbol}",
+        color=discord.Color.blue()
     )
     
-    # セットアップ情報
     embed.add_field(
-        name="📊 セットアップ情報（ルール②）",
-        value=f"• 日付: `{setup['date'].strftime('%Y-%m-%d')}`\n"
-              f"• SMA200: `${setup['sma200']:.2f}`\n"
-              f"• EMA200: `${setup['ema200']:.2f}`\n"
-              f"• ゾーン幅: `{abs(setup['zone_upper'] - setup['zone_lower']):.2f}`",
+        name="",
+        value=f"日時：{datetime.now(JST).strftime('今日 %H:%M')}",
         inline=False
     )
-    
-    # FVG情報
-    embed.add_field(
-        name="🎯 FVG情報（ルール③）",
-        value=f"• 形成日: `{fvg['formation_date'].strftime('%Y-%m-%d')}`\n"
-              f"• 上限: `${fvg['upper_bound']:.2f}`\n"
-              f"• 下限: `${fvg['lower_bound']:.2f}`\n"
-              f"• ギャップサイズ: `{fvg['gap_percentage']:.2f}%`",
-        inline=False
-    )
-    
-    # 現在の状況
-    embed.add_field(
-        name="📍 現在の状況",
-        value=f"• 現在価格: `${result['current_price']:.2f}`\n"
-              f"• 週足SMA200: `${result['weekly_sma200']:.2f}` ✅\n"
-              f"• MA近接条件: 満たしています ✅",
-        inline=False
-    )
-    
-    # 次のステップ
-    embed.add_field(
-        name="➡️ 次のステップ",
-        value="レジスタンス突破（ルール④）を監視します。\n"
-              "セットアップ翌日からの高値を超えるブレイクアウトを待ちます。",
-        inline=False
-    )
-    
-    embed.set_footer(text="HWB Strategy Alert System")
     
     return embed
 
-def create_hwb_breakout_alert_embed(result: Dict) -> discord.Embed:
-    """戦略2（ルール④: ブレイクアウト）のアラート用Embed"""
-    symbol = result["symbol"]
-    breakout = result["breakout"]
-    setup = result["setup"]
-    fvg = result["fvg"]
-    
-    try:
-        company_name = yf.Ticker(symbol).info.get("longName", symbol)
-    except:
-        company_name = symbol
-    
-    price_change = ((breakout['breakout_price'] - breakout['resistance_price']) / 
-                    breakout['resistance_price']) * 100
-    
+def create_simple_s2_embed(symbol: str, alerts: List[Dict]) -> discord.Embed:
+    """戦略2の簡略化されたEmbed（複数ブレイクアウトをまとめる）"""
     embed = discord.Embed(
-        title=f"🚀 HWB戦略2: ブレイクアウト達成 - {symbol}",
-        description=f"**{company_name}** がルール④の条件を満たし、エントリーシグナルが発生しました！",
-        color=discord.Color.green(),
-        timestamp=datetime.now()
+        title=f"🚀シグナル - {symbol}",
+        color=discord.Color.green()
     )
-    
-    # ブレイクアウト情報
-    embed.add_field(
-        name="💥 ブレイクアウト情報",
-        value=f"• 現在価格: `${breakout['breakout_price']:.2f}`\n"
-              f"• レジスタンス: `${breakout['resistance_price']:.2f}`\n"
-              f"• 上昇率: `+{price_change:.1f}%`",
-        inline=False
-    )
-    
-    # セットアップからの経過
-    days_since_setup = (breakout['breakout_date'] - setup['date']).days
-    days_since_fvg = (breakout['breakout_date'] - fvg['formation_date']).days
     
     embed.add_field(
-        name="⏱️ タイミング",
-        value=f"• セットアップから: `{days_since_setup}日`\n"
-              f"• FVG形成から: `{days_since_fvg}日`\n"
-              f"• FVGサポート: `${fvg['lower_bound']:.2f}` (維持中✅)",
+        name="",
+        value=f"日時：{datetime.now(JST).strftime('今日 %H:%M')}",
         inline=False
     )
-    
-    # トレード戦略
-    stop_loss = fvg['lower_bound'] * 0.98
-    target_1 = breakout['breakout_price'] * 1.05
-    target_2 = breakout['breakout_price'] * 1.10
-    
-    embed.add_field(
-        name="📋 推奨トレード戦略",
-        value=f"• エントリー: `${breakout['breakout_price']:.2f}`\n"
-              f"• ストップロス: `${stop_loss:.2f}` (FVG下限の2%下)\n"
-              f"• 目標1: `${target_1:.2f}` (+5%)\n"
-              f"• 目標2: `${target_2:.2f}` (+10%)",
-        inline=False
-    )
-    
-    # リスクリワード
-    risk = breakout['breakout_price'] - stop_loss
-    reward_1 = target_1 - breakout['breakout_price']
-    rr_ratio = reward_1 / risk
-    
-    embed.add_field(
-        name="⚖️ リスク管理",
-        value=f"• リスク: `${risk:.2f}`\n"
-              f"• リワード: `${reward_1:.2f}`\n"
-              f"• R/R比: `1:{rr_ratio:.1f}`",
-        inline=False
-    )
-    
-    embed.set_footer(text="HWB Strategy Alert System - Trade at your own risk")
     
     return embed
 
@@ -739,20 +759,7 @@ async def scan_all_symbols_optimized():
                 
                 if results:
                     for result in results:
-                        # 重複チェック（24時間以内に同じアラートを送信しない）
-                        alert_key = f"{symbol}_{result['signal_type']}"
-                        
-                        if result['signal_type'] == 's1_fvg_detected':
-                            if alert_key not in fvg_alerts or \
-                               (datetime.now() - fvg_alerts[alert_key]) > timedelta(hours=24):
-                                alerts.append(result)
-                                fvg_alerts[alert_key] = datetime.now()
-                        
-                        elif result['signal_type'] == 's2_breakout':
-                            if alert_key not in breakout_alerts or \
-                               (datetime.now() - breakout_alerts[alert_key]) > timedelta(hours=24):
-                                alerts.append(result)
-                                breakout_alerts[alert_key] = datetime.now()
+                        alerts.append(result)
                 
                 processed += 1
                 if processed % 10 == 0:
@@ -763,12 +770,6 @@ async def scan_all_symbols_optimized():
         
         print(f"スキャン完了: {len(alerts)}件のシグナルを検出")
         
-        # 統計情報を保存
-        scan_all_symbols_optimized.last_stats = {
-            'rule1_pass_rate': len(passed_rule1) / len(all_symbols) * 100 if all_symbols else 0,
-            'total_signals': len(alerts)
-        }
-        
     except Exception as e:
         print(f"スキャンエラー: {e}")
         import traceback
@@ -778,9 +779,11 @@ async def scan_all_symbols_optimized():
 
 def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     """サマリーEmbed作成"""
-    # 戦略1と戦略2のティッカーを分離
-    strategy1_tickers = [a['symbol'] for a in alerts if a['signal_type'] == 's1_fvg_detected']
-    strategy2_tickers = [a['symbol'] for a in alerts if a['signal_type'] == 's2_breakout']
+    # 戦略2のティッカーを先に抽出
+    strategy2_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's2_breakout']))
+    
+    # 戦略1のティッカーから戦略2のティッカーを除外
+    strategy1_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's1_fvg_detected' and a['symbol'] not in strategy2_tickers]))
     
     embed = discord.Embed(
         title="AI判定システム",
@@ -790,13 +793,13 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     
     # 監視候補（戦略1）
     if strategy1_tickers:
-        tickers_str = ', '.join(strategy1_tickers)
+        tickers_str = ', '.join(sorted(strategy1_tickers))
         # Discordのフィールド値制限（1024文字）を考慮
         if len(tickers_str) > 1000:
             # 文字数制限を超える場合は省略
             tickers_list = []
             current_length = 0
-            for ticker in strategy1_tickers:
+            for ticker in sorted(strategy1_tickers):
                 if current_length + len(ticker) + 2 < 980:  # カンマとスペースを考慮
                     tickers_list.append(ticker)
                     current_length += len(ticker) + 2
@@ -819,13 +822,13 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     
     # シグナル（戦略2）
     if strategy2_tickers:
-        tickers_str = ', '.join(strategy2_tickers)
+        tickers_str = ', '.join(sorted(strategy2_tickers))
         # Discordのフィールド値制限（1024文字）を考慮
         if len(tickers_str) > 1000:
             # 文字数制限を超える場合は省略
             tickers_list = []
             current_length = 0
-            for ticker in strategy2_tickers:
+            for ticker in sorted(strategy2_tickers):
                 if current_length + len(ticker) + 2 < 980:  # カンマとスペースを考慮
                     tickers_list.append(ticker)
                     current_length += len(ticker) + 2
@@ -873,53 +876,45 @@ async def post_alerts(channel, alerts: List[Dict]):
     
     # 個別アラートの投稿（該当する設定がONの場合のみ）
     if POST_STRATEGY1_ALERTS or POST_STRATEGY2_ALERTS:
+        # 銘柄ごとにアラートをグループ化
+        alerts_by_symbol = {}
+        for alert in alerts:
+            symbol = alert['symbol']
+            if symbol not in alerts_by_symbol:
+                alerts_by_symbol[symbol] = []
+            alerts_by_symbol[symbol].append(alert)
+        
+        # 戦略2のアラートを持つ銘柄を特定
+        s2_symbols = set()
+        for symbol, symbol_alerts in alerts_by_symbol.items():
+            if any(a['signal_type'] == 's2_breakout' for a in symbol_alerts):
+                s2_symbols.add(symbol)
+        
         posted_count = 0
         max_individual_alerts = 30
         
-        for alert in alerts:
-            # 投稿上限チェック
+        for symbol, symbol_alerts in alerts_by_symbol.items():
             if posted_count >= max_individual_alerts:
                 break
             
-            # 戦略1アラート（FVG検出）
-            if alert['signal_type'] == 's1_fvg_detected' and POST_STRATEGY1_ALERTS:
-                try:
-                    embed = create_hwb_fvg_alert_embed(alert)
-                    
-                    # チャート作成
-                    chart = HWBAnalyzer.create_hwb_chart(
-                        alert['symbol'], 
-                        setup_date=alert['setup']['date'],
-                        fvg_info=alert['fvg']
-                    )
-                    
-                    if chart:
-                        file = discord.File(chart, filename=f"{alert['symbol']}_hwb_chart.png")
-                        embed.set_image(url=f"attachment://{alert['symbol']}_hwb_chart.png")
-                        await channel.send(embed=embed, file=file)
-                    else:
-                        await channel.send(embed=embed)
-                    
-                    posted_count += 1
-                    
-                except Exception as e:
-                    print(f"戦略1アラート送信エラー ({alert['symbol']}): {e}")
+            # 戦略1と戦略2のアラートを分離
+            s1_alerts = [a for a in symbol_alerts if a['signal_type'] == 's1_fvg_detected']
+            s2_alerts = [a for a in symbol_alerts if a['signal_type'] == 's2_breakout']
             
             # 戦略2アラート（ブレイクアウト）
-            elif alert['signal_type'] == 's2_breakout' and POST_STRATEGY2_ALERTS:
+            if s2_alerts and POST_STRATEGY2_ALERTS:
                 try:
-                    embed = create_hwb_breakout_alert_embed(alert)
+                    embed = create_simple_s2_embed(symbol, s2_alerts)
                     
-                    # チャート作成
+                    # チャート作成（ゾーンなし、週足SMA200付き）
                     chart = HWBAnalyzer.create_hwb_chart(
-                        alert['symbol'],
-                        setup_date=alert['setup']['date'],
-                        fvg_info=alert['fvg']
+                        symbol,
+                        show_zones=False  # ゾーンを非表示
                     )
                     
                     if chart:
-                        file = discord.File(chart, filename=f"{alert['symbol']}_hwb_chart.png")
-                        embed.set_image(url=f"attachment://{alert['symbol']}_hwb_chart.png")
+                        file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
+                        embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
                         await channel.send(embed=embed, file=file)
                     else:
                         await channel.send(embed=embed)
@@ -927,12 +922,35 @@ async def post_alerts(channel, alerts: List[Dict]):
                     posted_count += 1
                     
                 except Exception as e:
-                    print(f"戦略2アラート送信エラー ({alert['symbol']}): {e}")
+                    print(f"戦略2アラート送信エラー ({symbol}): {e}")
+            
+            # 戦略1アラート（FVG検出）- 戦略2がない場合のみ
+            elif s1_alerts and POST_STRATEGY1_ALERTS and symbol not in s2_symbols:
+                try:
+                    embed = create_simple_s1_embed(symbol, s1_alerts)
+                    
+                    # チャート作成（ゾーンなし、週足SMA200付き）
+                    chart = HWBAnalyzer.create_hwb_chart(
+                        symbol,
+                        show_zones=False  # ゾーンを非表示
+                    )
+                    
+                    if chart:
+                        file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
+                        embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
+                        await channel.send(embed=embed, file=file)
+                    else:
+                        await channel.send(embed=embed)
+                    
+                    posted_count += 1
+                    
+                except Exception as e:
+                    print(f"戦略1アラート送信エラー ({symbol}): {e}")
         
         # 投稿上限に達した場合の通知
-        if posted_count >= max_individual_alerts and len(alerts) > max_individual_alerts:
-            remaining = len(alerts) - max_individual_alerts
-            await channel.send(f"📋 他に{remaining}件のアラートがありますが、投稿上限に達しました。")
+        if posted_count >= max_individual_alerts and len(alerts_by_symbol) > max_individual_alerts:
+            remaining = len(alerts_by_symbol) - max_individual_alerts
+            await channel.send(f"📋 他に{remaining}銘柄のアラートがありますが、投稿上限に達しました。")
 
 # Bot イベント
 @bot.event
@@ -951,11 +969,33 @@ async def on_ready():
     # キャッシュディレクトリを作成
     os.makedirs("cache", exist_ok=True)
     
+    # シグナル履歴の初期化（オプション）
+    print("\n過去のシグナル履歴を初期化中...")
+    await initialize_signal_history()
+    
     for guild in bot.guilds:
         await setup_guild(guild)
     
     # 日次スキャンタスクを開始
     daily_scan.start()
+
+async def initialize_signal_history():
+    """起動時に過去のシグナル履歴を初期化"""
+    # 処理時間短縮のため、主要銘柄のみ初期化（オプション）
+    # 全銘柄を初期化すると時間がかかるため、最初のスキャン時に
+    # 動的に初期化する現在の実装でも問題ない
+    
+    # 主要銘柄のサンプル（高速初期化用）
+    major_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+    
+    initialized_count = 0
+    for symbol in major_symbols:
+        if symbol in watched_symbols:
+            # 履歴をチェック
+            if HWBAnalyzer.has_recent_signal(symbol, SETUP_LOOKBACK_DAYS):
+                initialized_count += 1
+    
+    print(f"  {initialized_count}銘柄の履歴を初期化しました")
 
 @bot.event
 async def on_guild_join(guild):
@@ -1069,13 +1109,13 @@ async def bot_status(ctx):
         inline=True
     )
     
-    # 最近のアラート数
-    recent_fvg = len([t for t in fvg_alerts.values() if datetime.now() - t < timedelta(hours=24)])
-    recent_breakout = len([t for t in breakout_alerts.values() if datetime.now() - t < timedelta(hours=24)])
+    # シグナル履歴統計
+    recent_signals = len([s for s in signal_history.values() 
+                         if (datetime.now() - s['last_signal_date']).days <= SETUP_LOOKBACK_DAYS])
     
     embed.add_field(
-        name="24時間以内のアラート",
-        value=f"戦略1: {recent_fvg}件\n戦略2: {recent_breakout}件",
+        name=f"{SETUP_LOOKBACK_DAYS}日以内のシグナル履歴",
+        value=f"{recent_signals} 銘柄",
         inline=False
     )
     
@@ -1111,29 +1151,52 @@ async def check_symbol(ctx, symbol: str):
             await ctx.send(f"{symbol} はルール①（週足トレンド）を満たしていません。")
             return
         
-        # ルール②③④をチェック
-        results = await HWBAnalyzer.check_remaining_rules_async(symbol)
+        # 過去のシグナル履歴をチェック（データから直接）
+        cache_key = datetime.now().strftime("%Y%m%d")
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+        
+        if df_daily is not None:
+            df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+            last_signal_setup = HWBAnalyzer.check_historical_signals(symbol, df_daily)
+            
+            if last_signal_setup:
+                days_since = (datetime.now().date() - last_signal_setup.date()).days
+                if days_since <= SETUP_LOOKBACK_DAYS:
+                    await ctx.send(
+                        f"❌ {symbol} は{days_since}日前（{last_signal_setup.strftime('%Y-%m-%d')}）の"
+                        f"セットアップでシグナルを出しています。\n"
+                        f"新しいセットアップが形成されるまで除外されています。"
+                    )
+                    return
+        
+        # ルール②③④をチェック（履歴チェックなし）
+        results = await HWBAnalyzer.check_remaining_rules_async(symbol, check_history=False)
         
         if not results:
-            await ctx.send(f"{symbol} はルール②以降の条件を満たしていません。")
+            await ctx.send(f"該当なし - {symbol} は現在の条件を満たしていません。")
             return
         
         # 個別チェックの場合は常に結果を表示（投稿設定に関係なく）
         await ctx.send(f"✅ {symbol} は以下の条件を満たしています：")
         
-        for result in results:
-            if result['signal_type'] == 's1_fvg_detected':
-                embed = create_hwb_fvg_alert_embed(result)
+        # 銘柄ごとにアラートをグループ化
+        s1_alerts = [r for r in results if r['signal_type'] == 's1_fvg_detected']
+        s2_alerts = [r for r in results if r['signal_type'] == 's2_breakout']
+        
+        # 戦略2アラートがある場合は戦略2のみ表示
+        if s2_alerts:
+            embed = create_simple_s2_embed(symbol, s2_alerts)
+            chart = HWBAnalyzer.create_hwb_chart(symbol, show_zones=False)
+            if chart:
+                file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
+                embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
+                await ctx.send(embed=embed, file=file)
             else:
-                embed = create_hwb_breakout_alert_embed(result)
-            
-            # チャート作成
-            chart = HWBAnalyzer.create_hwb_chart(
-                symbol,
-                setup_date=result['setup']['date'],
-                fvg_info=result['fvg']
-            )
-            
+                await ctx.send(embed=embed)
+        # 戦略2がない場合のみ戦略1を表示
+        elif s1_alerts:
+            embed = create_simple_s1_embed(symbol, s1_alerts)
+            chart = HWBAnalyzer.create_hwb_chart(symbol, show_zones=False)
             if chart:
                 file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
                 embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
@@ -1152,6 +1215,15 @@ async def clear_cache(ctx):
     cache_size = len(data_cache)
     data_cache.clear()
     await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
+
+@bot.command(name="clear_history")
+@commands.has_permissions(administrator=True)
+async def clear_history(ctx):
+    """シグナル履歴をクリア（管理者のみ）"""
+    global signal_history
+    history_size = len(signal_history)
+    signal_history.clear()
+    await ctx.send(f"✅ シグナル履歴をクリアしました（{history_size}件）")
 
 @bot.command(name="toggle")
 @commands.has_permissions(administrator=True)
