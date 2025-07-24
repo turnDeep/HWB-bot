@@ -276,6 +276,11 @@ class HWBAnalyzer:
                 
                 # 最後のシグナルからの経過日数をチェック
                 days_since_signal = (datetime.now().date() - last_signal_setup_date.date()).days
+                
+                # デバッグ情報
+                if symbol in ["NVDA", "AAPL", "MSFT"] and days_since_signal <= lookback_days:
+                    print(f"{symbol}: 履歴チェック - {days_since_signal}日前のシグナルあり（除外）")
+                
                 return days_since_signal <= lookback_days
             
             return False
@@ -355,26 +360,90 @@ class HWBAnalyzer:
     @staticmethod
     def check_historical_signals(symbol: str, df_daily: pd.DataFrame) -> Optional[pd.Timestamp]:
         """過去のシグナル（ルール④達成）をチェックして、最新のセットアップ日を返す"""
-        # 過去のセットアップをすべて検出
-        all_setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
+        # 過去のセットアップをすべて検出（より長い期間をチェック）
+        all_setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS * 2)
         if not all_setups:
             return None
         
         # 新しい順にソート
         all_setups.sort(key=lambda x: x['date'], reverse=True)
         
+        # デバッグ用
+        if symbol in ["NVDA", "AAPL", "MSFT"]:
+            print(f"\n{symbol} - 過去のセットアップ数: {len(all_setups)}")
+            if all_setups:
+                print(f"  最新セットアップ: {all_setups[0]['date'].strftime('%Y-%m-%d')}")
+        
         # 各セットアップに対してルール③④をチェック
         for setup in all_setups:
-            # FVG検出
-            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup['date'])
+            # FVG検出（より長い期間をチェック）
+            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup['date'], max_days_after=30)
+            
+            if symbol in ["NVDA", "AAPL", "MSFT"] and fvgs:
+                print(f"  FVG検出数: {len(fvgs)} (セットアップ: {setup['date'].strftime('%Y-%m-%d')})")
             
             for fvg in fvgs:
-                # ブレイクアウトチェック
-                breakout = HWBAnalyzer.check_breakout(df_daily, setup, fvg)
+                # ブレイクアウトチェック（過去のデータ全体を見る）
+                breakout = HWBAnalyzer.check_historical_breakout(df_daily, setup, fvg)
                 
                 if breakout:
+                    # デバッグ情報
+                    if symbol in ["NVDA", "AAPL", "MSFT"]:
+                        print(f"  ✓ ブレイクアウト検出: セットアップ日={setup['date'].strftime('%Y-%m-%d')}, "
+                              f"ブレイクアウト日={breakout['breakout_date'].strftime('%Y-%m-%d')}, "
+                              f"価格=${breakout['breakout_price']:.2f}")
+                    
                     # ブレイクアウトが発生している = 過去にシグナルを出した
                     return setup['date']
+        
+        if symbol in ["NVDA", "AAPL", "MSFT"]:
+            print(f"  × ブレイクアウトなし")
+        
+        return None
+    
+    @staticmethod
+    def check_historical_breakout(df_daily: pd.DataFrame, setup: Dict, fvg: Dict) -> Optional[Dict]:
+        """過去のブレイクアウトをチェック（履歴確認用）"""
+        setup_date = setup['date']
+        fvg_formation_date = fvg['formation_date']
+        fvg_lower = fvg['lower_bound']
+        
+        try:
+            setup_idx = df_daily.index.get_loc(setup_date)
+            fvg_idx = df_daily.index.get_loc(fvg_formation_date)
+        except KeyError:
+            return None
+        
+        # FVG形成後のすべてのデータを確認
+        post_fvg_data = df_daily.iloc[fvg_idx + 1:]
+        if len(post_fvg_data) == 0:
+            return None
+        
+        # レジスタンス計算（セットアップ翌日からFVG形成前日まで）
+        resistance_start_idx = setup_idx + 1
+        resistance_end_idx = fvg_idx
+        
+        if resistance_end_idx <= resistance_start_idx:
+            # FVGがセットアップの直後の場合は、セットアップ前の高値を使用
+            resistance_high = df_daily.iloc[max(0, setup_idx - 20):setup_idx + 1]['High'].max()
+        else:
+            resistance_high = df_daily.iloc[resistance_start_idx:resistance_end_idx]['High'].max()
+        
+        # FVG下限が破られたかチェック
+        min_low_after_fvg = post_fvg_data['Low'].min()
+        if min_low_after_fvg < fvg_lower:
+            return None  # FVGが破られた
+        
+        # ブレイクアウトが発生したかチェック
+        for i in range(len(post_fvg_data)):
+            if post_fvg_data.iloc[i]['Close'] > resistance_high * (1 + BREAKOUT_THRESHOLD):
+                return {
+                    'breakout_date': post_fvg_data.index[i],
+                    'breakout_price': post_fvg_data.iloc[i]['Close'],
+                    'resistance_price': resistance_high,
+                    'setup_info': setup,
+                    'fvg_info': fvg
+                }
         
         return None
     
@@ -398,6 +467,15 @@ class HWBAnalyzer:
                 if last_signal_setup_date:
                     # 履歴に記録
                     HWBAnalyzer.update_signal_history(symbol, last_signal_setup_date)
+                    
+                    # デバッグ情報
+                    days_since = (datetime.now().date() - last_signal_setup_date.date()).days
+                    if symbol in ["NVDA", "AAPL", "MSFT"]:
+                        print(f"{symbol}: 過去のシグナル検出 - {days_since}日前")
+                    
+                    # 期間内なら除外
+                    if days_since <= SETUP_LOOKBACK_DAYS:
+                        return []
             else:
                 last_signal_setup_date = signal_history[symbol].get('last_setup_date')
         
@@ -553,24 +631,27 @@ class HWBAnalyzer:
         if latest_idx <= fvg_idx:
             return None
         
-        # レジスタンス計算（セットアップ翌日から昨日まで）
+        # レジスタンス計算の改善
+        # セットアップ翌日からFVG形成日までの高値
         resistance_start_idx = setup_idx + 1
-        resistance_end_idx = latest_idx - 1
+        resistance_end_idx = fvg_idx
         
         if resistance_end_idx <= resistance_start_idx:
-            return None
+            # FVGがセットアップ直後の場合、セットアップ前の高値も含める
+            resistance_start_idx = max(0, setup_idx - 10)
+            resistance_end_idx = setup_idx + 1
         
-        resistance_high = df_daily.iloc[resistance_start_idx:resistance_end_idx + 1]['High'].max()
+        resistance_high = df_daily.iloc[resistance_start_idx:resistance_end_idx]['High'].max()
         
         # 現在の価格
         current = df_daily.iloc[-1]
         
         # FVG下限がサポートとして機能しているか
         post_fvg_lows = df_daily.iloc[fvg_idx + 1:]['Low']
-        if (post_fvg_lows < fvg_lower).any():
+        if len(post_fvg_lows) > 0 and (post_fvg_lows < fvg_lower).any():
             return None  # FVGが破られた
         
-        # ブレイクアウト確認
+        # ブレイクアウト確認（現在の終値のみをチェック）
         if current['Close'] > resistance_high * (1 + BREAKOUT_THRESHOLD):
             return {
                 'breakout_date': df_daily.index[-1],
@@ -743,6 +824,7 @@ async def scan_all_symbols_optimized():
         # ステップ2: ルール②③④をチェック（非同期）
         print("ステップ2: ルール②③④をチェック中...")
         processed = 0
+        excluded_count = 0
         
         # バッチごとに非同期処理
         for i in range(0, len(passed_rule1), BATCH_SIZE):
@@ -757,18 +839,22 @@ async def scan_all_symbols_optimized():
                     print(f"エラー ({symbol}): {results}")
                     continue
                 
+                # 履歴により除外された場合をカウント
+                if not results and HWBAnalyzer.has_recent_signal(symbol, SETUP_LOOKBACK_DAYS):
+                    excluded_count += 1
+                
                 if results:
                     for result in results:
                         alerts.append(result)
                 
                 processed += 1
                 if processed % 10 == 0:
-                    print(f"  進捗: {processed}/{len(passed_rule1)} (シグナル: {len(alerts)}件)")
+                    print(f"  進捗: {processed}/{len(passed_rule1)} (シグナル: {len(alerts)}件, 履歴除外: {excluded_count}件)")
             
             # バッチ間でイベントループに制御を返す
             await asyncio.sleep(0.1)
         
-        print(f"スキャン完了: {len(alerts)}件のシグナルを検出")
+        print(f"スキャン完了: {len(alerts)}件のシグナルを検出 (履歴により{excluded_count}件を除外)")
         
     except Exception as e:
         print(f"スキャンエラー: {e}")
@@ -1127,11 +1213,28 @@ async def manual_scan(ctx):
     """手動でスキャンを実行（管理者のみ）"""
     await ctx.send("📡 手動スキャンを開始します... (時間がかかる場合があります)")
     
+    # デバッグモード有効化メッセージ
+    await ctx.send("📊 デバッグモードで実行中（NVDA、AAPL、MSFTの詳細情報を表示）")
+    
     start_time = datetime.now()
     alerts = await scan_all_symbols_optimized()
     processing_time = (datetime.now() - start_time).total_seconds()
     
-    await ctx.send(f"スキャン完了: {processing_time:.1f}秒")
+    # 除外された銘柄の情報
+    excluded_info = []
+    for symbol in ["NVDA", "AAPL", "MSFT"]:
+        if symbol in signal_history:
+            last_setup = signal_history[symbol].get('last_setup_date')
+            if last_setup:
+                days_since = (datetime.now().date() - last_setup.date()).days
+                if days_since <= SETUP_LOOKBACK_DAYS:
+                    excluded_info.append(f"{symbol}: {days_since}日前")
+    
+    scan_summary = f"スキャン完了: {processing_time:.1f}秒"
+    if excluded_info:
+        scan_summary += f"\n除外銘柄: {', '.join(excluded_info)}"
+    
+    await ctx.send(scan_summary)
     
     if alerts:
         await post_alerts(ctx.channel, alerts)
@@ -1157,16 +1260,28 @@ async def check_symbol(ctx, symbol: str):
         
         if df_daily is not None:
             df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+            
+            # デバッグモードで詳細表示
+            if symbol in ["NVDA", "AAPL", "MSFT"]:
+                await ctx.send(f"📊 {symbol}の過去のシグナルをチェック中...")
+            
             last_signal_setup = HWBAnalyzer.check_historical_signals(symbol, df_daily)
             
             if last_signal_setup:
                 days_since = (datetime.now().date() - last_signal_setup.date()).days
                 if days_since <= SETUP_LOOKBACK_DAYS:
-                    await ctx.send(
+                    # より詳細な情報を表示
+                    detailed_msg = (
                         f"❌ {symbol} は{days_since}日前（{last_signal_setup.strftime('%Y-%m-%d')}）の"
                         f"セットアップでシグナルを出しています。\n"
                         f"新しいセットアップが形成されるまで除外されています。"
                     )
+                    
+                    # デバッグ銘柄の場合、より詳細な情報を追加
+                    if symbol in ["NVDA", "AAPL", "MSFT"]:
+                        detailed_msg += f"\n\n📈 除外期間: あと{SETUP_LOOKBACK_DAYS - days_since}日"
+                    
+                    await ctx.send(detailed_msg)
                     return
         
         # ルール②③④をチェック（履歴チェックなし）
