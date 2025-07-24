@@ -47,6 +47,9 @@ FVG_ZONE_PROXIMITY = float(os.getenv("FVG_ZONE_PROXIMITY", 0.10))
 BREAKOUT_THRESHOLD = float(os.getenv("BREAKOUT_THRESHOLD", 0.001))
 SETUP_LOOKBACK_DAYS = int(os.getenv("SETUP_LOOKBACK_DAYS", 60))
 
+# シグナル管理の新パラメータ
+SIGNAL_COOLING_PERIOD = int(os.getenv("SIGNAL_COOLING_PERIOD", 14))  # 冷却期間（デフォルト14日）
+
 # 投稿設定
 def parse_bool_env(key: str, default: bool) -> bool:
     """環境変数をboolに変換（エラーハンドリング付き）"""
@@ -69,11 +72,122 @@ fvg_alerts = {}
 breakout_alerts = {}
 server_configs = {}
 data_cache = {}
-signal_history = {}  # シグナル履歴を記録
 
 # タイムゾーン設定
 ET = pytz.timezone("US/Eastern")
 JST = pytz.timezone("Asia/Tokyo")
+
+
+class ImprovedSignalManager:
+    """改善されたシグナル履歴管理クラス"""
+    
+    def __init__(self, cooling_period: int = 14):
+        """
+        Parameters:
+        -----------
+        cooling_period : int
+            シグナル発生後の冷却期間（日数）
+        """
+        self.signal_history = {}
+        self.cooling_period = cooling_period
+        
+    def should_process_setup(self, symbol: str, setup_date: pd.Timestamp) -> bool:
+        """
+        セットアップを処理すべきか判断
+        
+        Returns:
+        --------
+        bool : 処理すべきならTrue
+        """
+        if symbol not in self.signal_history:
+            return True
+        
+        history = self.signal_history[symbol]
+        
+        # 1. 同じセットアップは二度処理しない
+        completed_setups = history.get('completed_setups', [])
+        if any(abs((setup_date - completed).days) < 1 for completed in completed_setups):
+            # 日付の誤差を考慮（1日以内は同じセットアップとみなす）
+            return False
+        
+        # 2. 最新のシグナルから冷却期間をチェック
+        last_signal_date = history.get('last_signal_date')
+        if last_signal_date:
+            days_elapsed = (datetime.now() - last_signal_date).days
+            if days_elapsed < self.cooling_period:
+                # 冷却期間中でも、より新しいセットアップは評価
+                last_setup = history.get('last_setup_date')
+                if last_setup and setup_date > last_setup:
+                    return True
+                return False
+        
+        return True
+    
+    def record_signal(self, symbol: str, setup_date: pd.Timestamp):
+        """シグナル発生を記録"""
+        if symbol not in self.signal_history:
+            self.signal_history[symbol] = {
+                'completed_setups': [],
+                'last_signal_date': None,
+                'last_setup_date': None
+            }
+        
+        history = self.signal_history[symbol]
+        
+        # 完了済みセットアップとして記録
+        if setup_date not in history['completed_setups']:
+            history['completed_setups'].append(setup_date)
+        
+        history['last_signal_date'] = datetime.now()
+        history['last_setup_date'] = setup_date
+    
+    def get_excluded_reason(self, symbol: str, setup_date: pd.Timestamp) -> Optional[str]:
+        """除外理由を取得（デバッグ用）"""
+        if symbol not in self.signal_history:
+            return None
+        
+        history = self.signal_history[symbol]
+        
+        # 完了済みセットアップかチェック
+        completed_setups = history.get('completed_setups', [])
+        for completed in completed_setups:
+            if abs((setup_date - completed).days) < 1:
+                return f"セットアップ済み（{completed.strftime('%Y-%m-%d')}）"
+        
+        # 冷却期間中かチェック
+        last_signal_date = history.get('last_signal_date')
+        if last_signal_date:
+            days_elapsed = (datetime.now() - last_signal_date).days
+            if days_elapsed < self.cooling_period:
+                return f"冷却期間中（あと{self.cooling_period - days_elapsed}日）"
+        
+        return None
+    
+    def get_status_summary(self) -> Dict[str, Dict]:
+        """全銘柄のステータスサマリーを取得"""
+        summary = {}
+        now = datetime.now()
+        
+        for symbol, history in self.signal_history.items():
+            last_signal_date = history.get('last_signal_date')
+            if last_signal_date:
+                days_since = (now - last_signal_date).days
+                in_cooling = days_since < self.cooling_period
+                
+                summary[symbol] = {
+                    'completed_setups': len(history.get('completed_setups', [])),
+                    'last_signal': last_signal_date.strftime('%Y-%m-%d'),
+                    'days_since': days_since,
+                    'in_cooling_period': in_cooling,
+                    'cooling_remaining': max(0, self.cooling_period - days_since) if in_cooling else 0
+                }
+        
+        return summary
+
+
+# グローバルなシグナルマネージャーインスタンス
+signal_manager = ImprovedSignalManager(cooling_period=SIGNAL_COOLING_PERIOD)
+
 
 def get_nasdaq_nyse_symbols() -> Set[str]:
     """NASDAQ/NYSEの全銘柄リストを取得（重複除去）"""
@@ -141,6 +255,7 @@ def get_nasdaq_nyse_symbols() -> Set[str]:
         print(f"銘柄リスト取得エラー: {e}")
         # 最小限のリストを返す
         return set(["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"])
+
 
 class HWBAnalyzer:
     """HWB戦略の分析クラス（最適化版）"""
@@ -256,54 +371,6 @@ class HWBAnalyzer:
             return symbol, False
     
     @staticmethod
-    def has_recent_signal(symbol: str, lookback_days: int) -> bool:
-        """指定期間内にシグナルを出したことがあるかチェック"""
-        if symbol not in signal_history:
-            # 履歴がない場合は、データから直接チェック
-            cache_key = datetime.now().strftime("%Y%m%d")
-            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
-            
-            if df_daily is None or df_weekly is None:
-                return False
-            
-            df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
-            
-            # 過去のシグナルをチェック
-            last_signal_setup_date = HWBAnalyzer.check_historical_signals(symbol, df_daily)
-            if last_signal_setup_date:
-                # 履歴に記録
-                HWBAnalyzer.update_signal_history(symbol, last_signal_setup_date)
-                
-                # 最後のシグナルからの経過日数をチェック
-                days_since_signal = (datetime.now().date() - last_signal_setup_date.date()).days
-                
-                # デバッグ情報
-                if symbol in ["NVDA", "AAPL", "MSFT"] and days_since_signal <= lookback_days:
-                    print(f"{symbol}: 履歴チェック - {days_since_signal}日前のシグナルあり（除外）")
-                
-                return days_since_signal <= lookback_days
-            
-            return False
-        
-        last_signal_date = signal_history[symbol].get('last_signal_date')
-        if not last_signal_date:
-            return False
-        
-        # 最後のシグナルからの経過日数
-        days_since_signal = (datetime.now() - last_signal_date).days
-        
-        # lookback_days期間内にシグナルがある場合はTrue
-        return days_since_signal <= lookback_days
-    
-    @staticmethod
-    def update_signal_history(symbol: str, setup_date: pd.Timestamp):
-        """シグナル履歴を更新"""
-        signal_history[symbol] = {
-            'last_signal_date': datetime.now(),
-            'last_setup_date': setup_date
-        }
-    
-    @staticmethod
     async def batch_check_rule1_async(symbols: List[str]) -> Dict[str, bool]:
         """ルール①を複数銘柄に対して非同期バッチチェック"""
         results = {}
@@ -338,12 +405,8 @@ class HWBAnalyzer:
         return results
     
     @staticmethod
-    async def check_remaining_rules_async(symbol: str, check_history: bool = True) -> List[Dict]:
-        """ルール②③④を非同期でチェック"""
-        # シグナル履歴チェック
-        if check_history and HWBAnalyzer.has_recent_signal(symbol, SETUP_LOOKBACK_DAYS):
-            return []
-        
+    async def check_remaining_rules_async(symbol: str) -> List[Dict]:
+        """ルール②③④を非同期でチェック（改善版）"""
         loop = asyncio.get_event_loop()
         
         # ThreadPoolExecutorで同期関数を非同期実行
@@ -351,105 +414,14 @@ class HWBAnalyzer:
             result = await loop.run_in_executor(
                 executor,
                 HWBAnalyzer._check_remaining_rules_sync,
-                symbol,
-                check_history
+                symbol
             )
         
         return result
     
     @staticmethod
-    def check_historical_signals(symbol: str, df_daily: pd.DataFrame) -> Optional[pd.Timestamp]:
-        """過去のシグナル（ルール④達成）をチェックして、最新のセットアップ日を返す"""
-        # 過去のセットアップをすべて検出（より長い期間をチェック）
-        all_setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS * 2)
-        if not all_setups:
-            return None
-        
-        # 新しい順にソート
-        all_setups.sort(key=lambda x: x['date'], reverse=True)
-        
-        # デバッグ用
-        if symbol in ["NVDA", "AAPL", "MSFT"]:
-            print(f"\n{symbol} - 過去のセットアップ数: {len(all_setups)}")
-            if all_setups:
-                print(f"  最新セットアップ: {all_setups[0]['date'].strftime('%Y-%m-%d')}")
-        
-        # 各セットアップに対してルール③④をチェック
-        for setup in all_setups:
-            # FVG検出（より長い期間をチェック）
-            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup['date'], max_days_after=30)
-            
-            if symbol in ["NVDA", "AAPL", "MSFT"] and fvgs:
-                print(f"  FVG検出数: {len(fvgs)} (セットアップ: {setup['date'].strftime('%Y-%m-%d')})")
-            
-            for fvg in fvgs:
-                # ブレイクアウトチェック（過去のデータ全体を見る）
-                breakout = HWBAnalyzer.check_historical_breakout(df_daily, setup, fvg)
-                
-                if breakout:
-                    # デバッグ情報
-                    if symbol in ["NVDA", "AAPL", "MSFT"]:
-                        print(f"  ✓ ブレイクアウト検出: セットアップ日={setup['date'].strftime('%Y-%m-%d')}, "
-                              f"ブレイクアウト日={breakout['breakout_date'].strftime('%Y-%m-%d')}, "
-                              f"価格=${breakout['breakout_price']:.2f}")
-                    
-                    # ブレイクアウトが発生している = 過去にシグナルを出した
-                    return setup['date']
-        
-        if symbol in ["NVDA", "AAPL", "MSFT"]:
-            print(f"  × ブレイクアウトなし")
-        
-        return None
-    
-    @staticmethod
-    def check_historical_breakout(df_daily: pd.DataFrame, setup: Dict, fvg: Dict) -> Optional[Dict]:
-        """過去のブレイクアウトをチェック（履歴確認用）"""
-        setup_date = setup['date']
-        fvg_formation_date = fvg['formation_date']
-        fvg_lower = fvg['lower_bound']
-        
-        try:
-            setup_idx = df_daily.index.get_loc(setup_date)
-            fvg_idx = df_daily.index.get_loc(fvg_formation_date)
-        except KeyError:
-            return None
-        
-        # FVG形成後のすべてのデータを確認
-        post_fvg_data = df_daily.iloc[fvg_idx + 1:]
-        if len(post_fvg_data) == 0:
-            return None
-        
-        # レジスタンス計算（セットアップ翌日からFVG形成前日まで）
-        resistance_start_idx = setup_idx + 1
-        resistance_end_idx = fvg_idx
-        
-        if resistance_end_idx <= resistance_start_idx:
-            # FVGがセットアップの直後の場合は、セットアップ前の高値を使用
-            resistance_high = df_daily.iloc[max(0, setup_idx - 20):setup_idx + 1]['High'].max()
-        else:
-            resistance_high = df_daily.iloc[resistance_start_idx:resistance_end_idx]['High'].max()
-        
-        # FVG下限が破られたかチェック
-        min_low_after_fvg = post_fvg_data['Low'].min()
-        if min_low_after_fvg < fvg_lower:
-            return None  # FVGが破られた
-        
-        # ブレイクアウトが発生したかチェック
-        for i in range(len(post_fvg_data)):
-            if post_fvg_data.iloc[i]['Close'] > resistance_high * (1 + BREAKOUT_THRESHOLD):
-                return {
-                    'breakout_date': post_fvg_data.index[i],
-                    'breakout_price': post_fvg_data.iloc[i]['Close'],
-                    'resistance_price': resistance_high,
-                    'setup_info': setup,
-                    'fvg_info': fvg
-                }
-        
-        return None
-    
-    @staticmethod
-    def _check_remaining_rules_sync(symbol: str, check_history: bool = True) -> List[Dict]:
-        """ルール②③④の同期版チェック（内部用）"""
+    def _check_remaining_rules_sync(symbol: str) -> List[Dict]:
+        """ルール②③④の同期版チェック（改善版）"""
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
         
@@ -458,27 +430,6 @@ class HWBAnalyzer:
         
         df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
         
-        # 履歴チェックが有効な場合、過去のシグナルをチェック
-        last_signal_setup_date = None
-        if check_history:
-            # シグナル履歴がない場合は、過去データから検出
-            if symbol not in signal_history:
-                last_signal_setup_date = HWBAnalyzer.check_historical_signals(symbol, df_daily)
-                if last_signal_setup_date:
-                    # 履歴に記録
-                    HWBAnalyzer.update_signal_history(symbol, last_signal_setup_date)
-                    
-                    # デバッグ情報
-                    days_since = (datetime.now().date() - last_signal_setup_date.date()).days
-                    if symbol in ["NVDA", "AAPL", "MSFT"]:
-                        print(f"{symbol}: 過去のシグナル検出 - {days_since}日前")
-                    
-                    # 期間内なら除外
-                    if days_since <= SETUP_LOOKBACK_DAYS:
-                        return []
-            else:
-                last_signal_setup_date = signal_history[symbol].get('last_setup_date')
-        
         # ルール②セットアップを探す
         setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
         if not setups:
@@ -486,15 +437,20 @@ class HWBAnalyzer:
         
         results = []
         
-        # 過去のシグナルがある場合、それより新しいセットアップのみを対象とする
-        if check_history and last_signal_setup_date:
-            setups = [s for s in setups if s['date'] > last_signal_setup_date]
-            if not setups:
-                return []  # 新しいセットアップがない
-        
+        # 各セットアップに対してシグナルマネージャーでチェック
         for setup in setups:
+            setup_date = setup['date']
+            
+            # このセットアップを処理すべきかチェック
+            if not signal_manager.should_process_setup(symbol, setup_date):
+                # デバッグ情報
+                reason = signal_manager.get_excluded_reason(symbol, setup_date)
+                if symbol in ["NVDA", "AAPL", "MSFT"] and reason:
+                    print(f"{symbol}: セットアップ {setup_date.strftime('%Y-%m-%d')} は除外 - {reason}")
+                continue
+            
             # ルール③FVG検出
-            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup['date'])
+            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup_date)
             
             for fvg in fvgs:
                 # ルール④ブレイクアウトチェック
@@ -516,9 +472,8 @@ class HWBAnalyzer:
                         result['signal_type'] = 's2_breakout'
                         result['breakout'] = breakout
                         
-                        # シグナル履歴を更新
-                        if check_history:
-                            HWBAnalyzer.update_signal_history(symbol, setup['date'])
+                        # シグナル履歴を更新（ブレイクアウト時のみ記録）
+                        signal_manager.record_signal(symbol, setup_date)
                     
                     results.append(result)
         
@@ -742,6 +697,7 @@ class HWBAnalyzer:
             plt.close()
             return buf
 
+
 # Embed作成関数（簡略化版）
 def create_simple_s1_embed(symbol: str, alerts: List[Dict]) -> discord.Embed:
     """戦略1の簡略化されたEmbed（複数FVGをまとめる）"""
@@ -758,6 +714,7 @@ def create_simple_s1_embed(symbol: str, alerts: List[Dict]) -> discord.Embed:
     
     return embed
 
+
 def create_simple_s2_embed(symbol: str, alerts: List[Dict]) -> discord.Embed:
     """戦略2の簡略化されたEmbed（複数ブレイクアウトをまとめる）"""
     embed = discord.Embed(
@@ -772,6 +729,7 @@ def create_simple_s2_embed(symbol: str, alerts: List[Dict]) -> discord.Embed:
     )
     
     return embed
+
 
 # Bot機能
 async def setup_guild(guild):
@@ -799,8 +757,9 @@ async def setup_guild(guild):
     if alert_channel:
         print(f"サーバー '{guild.name}' の設定完了。アラートチャンネル: #{alert_channel.name}")
 
+
 async def scan_all_symbols_optimized():
-    """最適化された全銘柄スキャン（非同期版）"""
+    """最適化された全銘柄スキャン（改善版）"""
     alerts = []
     
     # すべての銘柄を取得
@@ -825,6 +784,7 @@ async def scan_all_symbols_optimized():
         print("ステップ2: ルール②③④をチェック中...")
         processed = 0
         excluded_count = 0
+        cooling_count = 0
         
         # バッチごとに非同期処理
         for i in range(0, len(passed_rule1), BATCH_SIZE):
@@ -839,9 +799,15 @@ async def scan_all_symbols_optimized():
                     print(f"エラー ({symbol}): {results}")
                     continue
                 
-                # 履歴により除外された場合をカウント
-                if not results and HWBAnalyzer.has_recent_signal(symbol, SETUP_LOOKBACK_DAYS):
-                    excluded_count += 1
+                # シグナル履歴による除外をカウント
+                if not results:
+                    status = signal_manager.signal_history.get(symbol)
+                    if status:
+                        excluded_count += 1
+                        if status.get('last_signal_date'):
+                            days_since = (datetime.now() - status['last_signal_date']).days
+                            if days_since < signal_manager.cooling_period:
+                                cooling_count += 1
                 
                 if results:
                     for result in results:
@@ -849,12 +815,15 @@ async def scan_all_symbols_optimized():
                 
                 processed += 1
                 if processed % 10 == 0:
-                    print(f"  進捗: {processed}/{len(passed_rule1)} (シグナル: {len(alerts)}件, 履歴除外: {excluded_count}件)")
+                    print(f"  進捗: {processed}/{len(passed_rule1)} "
+                          f"(シグナル: {len(alerts)}件, 履歴除外: {excluded_count}件, "
+                          f"冷却期間中: {cooling_count}件)")
             
             # バッチ間でイベントループに制御を返す
             await asyncio.sleep(0.1)
         
-        print(f"スキャン完了: {len(alerts)}件のシグナルを検出 (履歴により{excluded_count}件を除外)")
+        print(f"スキャン完了: {len(alerts)}件のシグナルを検出")
+        print(f"  履歴除外: {excluded_count}件（うち冷却期間中: {cooling_count}件）")
         
     except Exception as e:
         print(f"スキャンエラー: {e}")
@@ -862,6 +831,7 @@ async def scan_all_symbols_optimized():
         traceback.print_exc()
     
     return alerts
+
 
 def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     """サマリーEmbed作成"""
@@ -938,6 +908,7 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     embed.set_footer(text="AI Trading Analysis System")
     
     return embed
+
 
 async def post_alerts(channel, alerts: List[Dict]):
     """アラートを投稿"""
@@ -1038,6 +1009,7 @@ async def post_alerts(channel, alerts: List[Dict]):
             remaining = len(alerts_by_symbol) - max_individual_alerts
             await channel.send(f"📋 他に{remaining}銘柄のアラートがありますが、投稿上限に達しました。")
 
+
 # Bot イベント
 @bot.event
 async def on_ready():
@@ -1051,13 +1023,10 @@ async def on_ready():
     print(f"  サマリー: {'ON' if POST_SUMMARY else 'OFF'}")
     print(f"  戦略1アラート: {'ON' if POST_STRATEGY1_ALERTS else 'OFF'}")
     print(f"  戦略2アラート: {'ON' if POST_STRATEGY2_ALERTS else 'OFF'}")
+    print(f"  シグナル冷却期間: {signal_manager.cooling_period}日")
     
     # キャッシュディレクトリを作成
     os.makedirs("cache", exist_ok=True)
-    
-    # シグナル履歴の初期化（オプション）
-    print("\n過去のシグナル履歴を初期化中...")
-    await initialize_signal_history()
     
     for guild in bot.guilds:
         await setup_guild(guild)
@@ -1065,27 +1034,11 @@ async def on_ready():
     # 日次スキャンタスクを開始
     daily_scan.start()
 
-async def initialize_signal_history():
-    """起動時に過去のシグナル履歴を初期化"""
-    # 処理時間短縮のため、主要銘柄のみ初期化（オプション）
-    # 全銘柄を初期化すると時間がかかるため、最初のスキャン時に
-    # 動的に初期化する現在の実装でも問題ない
-    
-    # 主要銘柄のサンプル（高速初期化用）
-    major_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
-    
-    initialized_count = 0
-    for symbol in major_symbols:
-        if symbol in watched_symbols:
-            # 履歴をチェック
-            if HWBAnalyzer.has_recent_signal(symbol, SETUP_LOOKBACK_DAYS):
-                initialized_count += 1
-    
-    print(f"  {initialized_count}銘柄の履歴を初期化しました")
 
 @bot.event
 async def on_guild_join(guild):
     await setup_guild(guild)
+
 
 # 日次スキャンタスク
 @tasks.loop(minutes=1)
@@ -1129,14 +1082,16 @@ async def daily_scan():
                 except Exception as e:
                     print(f"投稿エラー (Guild {guild_id}): {e}")
 
+
 @daily_scan.before_loop
 async def before_daily_scan():
     await bot.wait_until_ready()
 
+
 # コマンド
 @bot.command(name="status")
 async def bot_status(ctx):
-    """Botのステータスを表示"""
+    """Botのステータスを表示（改善版）"""
     now_et = datetime.now(ET)
     now_jst = datetime.now(JST)
     market_close = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
@@ -1195,17 +1150,19 @@ async def bot_status(ctx):
         inline=True
     )
     
-    # シグナル履歴統計
-    recent_signals = len([s for s in signal_history.values() 
-                         if (datetime.now() - s['last_signal_date']).days <= SETUP_LOOKBACK_DAYS])
+    # シグナル履歴統計（改善版）
+    status_summary = signal_manager.get_status_summary()
+    cooling_count = sum(1 for s in status_summary.values() if s['in_cooling_period'])
+    total_signals = len(status_summary)
     
     embed.add_field(
-        name=f"{SETUP_LOOKBACK_DAYS}日以内のシグナル履歴",
-        value=f"{recent_signals} 銘柄",
+        name="シグナル履歴",
+        value=f"記録済み: {total_signals} 銘柄\n冷却期間中: {cooling_count} 銘柄\n冷却期間: {signal_manager.cooling_period}日",
         inline=False
     )
     
     await ctx.send(embed=embed)
+
 
 @bot.command(name="scan")
 @commands.has_permissions(administrator=True)
@@ -1220,19 +1177,23 @@ async def manual_scan(ctx):
     alerts = await scan_all_symbols_optimized()
     processing_time = (datetime.now() - start_time).total_seconds()
     
-    # 除外された銘柄の情報
+    # 除外された銘柄の情報（改善版）
     excluded_info = []
     for symbol in ["NVDA", "AAPL", "MSFT"]:
-        if symbol in signal_history:
-            last_setup = signal_history[symbol].get('last_setup_date')
-            if last_setup:
-                days_since = (datetime.now().date() - last_setup.date()).days
-                if days_since <= SETUP_LOOKBACK_DAYS:
-                    excluded_info.append(f"{symbol}: {days_since}日前")
+        if symbol in signal_manager.signal_history:
+            status = signal_manager.signal_history[symbol]
+            last_signal = status.get('last_signal_date')
+            if last_signal:
+                days_since = (datetime.now() - last_signal).days
+                if days_since < signal_manager.cooling_period:
+                    excluded_info.append(f"{symbol}: 冷却期間中（あと{signal_manager.cooling_period - days_since}日）")
+                else:
+                    completed = len(status.get('completed_setups', []))
+                    excluded_info.append(f"{symbol}: {completed}個のセットアップ完了済み")
     
     scan_summary = f"スキャン完了: {processing_time:.1f}秒"
     if excluded_info:
-        scan_summary += f"\n除外銘柄: {', '.join(excluded_info)}"
+        scan_summary += f"\n履歴情報: {', '.join(excluded_info)}"
     
     await ctx.send(scan_summary)
     
@@ -1241,9 +1202,10 @@ async def manual_scan(ctx):
     else:
         await ctx.send("シグナルは検出されませんでした。")
 
+
 @bot.command(name="check")
 async def check_symbol(ctx, symbol: str):
-    """特定の銘柄をチェック"""
+    """特定の銘柄をチェック（改善版）"""
     symbol = symbol.upper()
     await ctx.send(f"🔍 {symbol} をチェック中...")
     
@@ -1254,45 +1216,52 @@ async def check_symbol(ctx, symbol: str):
             await ctx.send(f"{symbol} はルール①（週足トレンド）を満たしていません。")
             return
         
-        # 過去のシグナル履歴をチェック（データから直接）
-        cache_key = datetime.now().strftime("%Y%m%d")
-        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+        # シグナル履歴の確認
+        history_info = ""
+        if symbol in signal_manager.signal_history:
+            status = signal_manager.signal_history[symbol]
+            last_signal = status.get('last_signal_date')
+            if last_signal:
+                days_since = (datetime.now() - last_signal).days
+                completed_count = len(status.get('completed_setups', []))
+                
+                history_info = f"\n\n📊 履歴情報:\n"
+                history_info += f"- 完了済みセットアップ: {completed_count}個\n"
+                history_info += f"- 最後のシグナル: {days_since}日前\n"
+                
+                if days_since < signal_manager.cooling_period:
+                    history_info += f"- 状態: 冷却期間中（あと{signal_manager.cooling_period - days_since}日）"
+                else:
+                    history_info += f"- 状態: 新規シグナル可能"
         
-        if df_daily is not None:
-            df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
-            
-            # デバッグモードで詳細表示
-            if symbol in ["NVDA", "AAPL", "MSFT"]:
-                await ctx.send(f"📊 {symbol}の過去のシグナルをチェック中...")
-            
-            last_signal_setup = HWBAnalyzer.check_historical_signals(symbol, df_daily)
-            
-            if last_signal_setup:
-                days_since = (datetime.now().date() - last_signal_setup.date()).days
-                if days_since <= SETUP_LOOKBACK_DAYS:
-                    # より詳細な情報を表示
-                    detailed_msg = (
-                        f"❌ {symbol} は{days_since}日前（{last_signal_setup.strftime('%Y-%m-%d')}）の"
-                        f"セットアップでシグナルを出しています。\n"
-                        f"新しいセットアップが形成されるまで除外されています。"
-                    )
-                    
-                    # デバッグ銘柄の場合、より詳細な情報を追加
-                    if symbol in ["NVDA", "AAPL", "MSFT"]:
-                        detailed_msg += f"\n\n📈 除外期間: あと{SETUP_LOOKBACK_DAYS - days_since}日"
-                    
-                    await ctx.send(detailed_msg)
-                    return
-        
-        # ルール②③④をチェック（履歴チェックなし）
-        results = await HWBAnalyzer.check_remaining_rules_async(symbol, check_history=False)
+        # ルール②③④をチェック（シグナルマネージャーのチェックを適用）
+        results = await HWBAnalyzer.check_remaining_rules_async(symbol)
         
         if not results:
-            await ctx.send(f"該当なし - {symbol} は現在の条件を満たしていません。")
+            # 除外理由を確認
+            excluded_setups = []
+            cache_key = datetime.now().strftime("%Y%m%d")
+            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+            
+            if df_daily is not None:
+                df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+                setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
+                
+                for setup in setups:
+                    reason = signal_manager.get_excluded_reason(symbol, setup['date'])
+                    if reason:
+                        excluded_setups.append(f"- {setup['date'].strftime('%Y-%m-%d')}: {reason}")
+            
+            msg = f"該当なし - {symbol} は現在の条件を満たしていません。"
+            if excluded_setups:
+                msg += f"\n\n除外されたセットアップ:\n" + "\n".join(excluded_setups)
+            msg += history_info
+            
+            await ctx.send(msg)
             return
         
-        # 個別チェックの場合は常に結果を表示（投稿設定に関係なく）
-        await ctx.send(f"✅ {symbol} は以下の条件を満たしています：")
+        # 結果表示
+        await ctx.send(f"✅ {symbol} は以下の条件を満たしています：{history_info}")
         
         # 銘柄ごとにアラートをグループ化
         s1_alerts = [r for r in results if r['signal_type'] == 's1_fvg_detected']
@@ -1322,6 +1291,7 @@ async def check_symbol(ctx, symbol: str):
     except Exception as e:
         await ctx.send(f"エラーが発生しました: {e}")
 
+
 @bot.command(name="clear_cache")
 @commands.has_permissions(administrator=True)
 async def clear_cache(ctx):
@@ -1331,14 +1301,113 @@ async def clear_cache(ctx):
     data_cache.clear()
     await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
 
+
 @bot.command(name="clear_history")
 @commands.has_permissions(administrator=True)
 async def clear_history(ctx):
     """シグナル履歴をクリア（管理者のみ）"""
-    global signal_history
-    history_size = len(signal_history)
-    signal_history.clear()
+    history_size = len(signal_manager.signal_history)
+    signal_manager.signal_history.clear()
     await ctx.send(f"✅ シグナル履歴をクリアしました（{history_size}件）")
+
+
+@bot.command(name="history")
+async def show_history(ctx, symbol: str = None):
+    """シグナル履歴を表示"""
+    if symbol:
+        # 特定銘柄の履歴
+        symbol = symbol.upper()
+        if symbol not in signal_manager.signal_history:
+            await ctx.send(f"{symbol} のシグナル履歴はありません。")
+            return
+        
+        history = signal_manager.signal_history[symbol]
+        embed = discord.Embed(
+            title=f"📊 {symbol} のシグナル履歴",
+            color=discord.Color.blue()
+        )
+        
+        last_signal = history.get('last_signal_date')
+        if last_signal:
+            days_since = (datetime.now() - last_signal).days
+            embed.add_field(
+                name="最後のシグナル",
+                value=f"{last_signal.strftime('%Y-%m-%d %H:%M')}\n({days_since}日前)",
+                inline=True
+            )
+        
+        completed = history.get('completed_setups', [])
+        embed.add_field(
+            name="完了済みセットアップ",
+            value=f"{len(completed)}個",
+            inline=True
+        )
+        
+        if days_since < signal_manager.cooling_period:
+            embed.add_field(
+                name="状態",
+                value=f"冷却期間中（あと{signal_manager.cooling_period - days_since}日）",
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="状態",
+                value="✅ 新規シグナル可能",
+                inline=True
+            )
+        
+        # 最近のセットアップ日を表示
+        if completed:
+            recent_setups = sorted(completed, reverse=True)[:5]
+            setup_list = [s.strftime('%Y-%m-%d') for s in recent_setups]
+            embed.add_field(
+                name="最近のセットアップ",
+                value="\n".join(setup_list),
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+    else:
+        # 全体のサマリー
+        status_summary = signal_manager.get_status_summary()
+        if not status_summary:
+            await ctx.send("シグナル履歴はまだありません。")
+            return
+        
+        embed = discord.Embed(
+            title="📊 シグナル履歴サマリー",
+            description=f"記録済み銘柄数: {len(status_summary)}",
+            color=discord.Color.blue()
+        )
+        
+        # 冷却期間中の銘柄
+        cooling_symbols = [(s, info) for s, info in status_summary.items() if info['in_cooling_period']]
+        if cooling_symbols:
+            cooling_list = []
+            for symbol, info in sorted(cooling_symbols, key=lambda x: x[1]['cooling_remaining'])[:10]:
+                cooling_list.append(f"{symbol}: あと{info['cooling_remaining']}日")
+            
+            embed.add_field(
+                name=f"冷却期間中の銘柄 ({len(cooling_symbols)})",
+                value="\n".join(cooling_list) + (f"\n...他{len(cooling_symbols)-10}銘柄" if len(cooling_symbols) > 10 else ""),
+                inline=False
+            )
+        
+        # 最近のシグナル
+        recent_signals = sorted(status_summary.items(), key=lambda x: x[1]['last_signal'], reverse=True)[:10]
+        if recent_signals:
+            recent_list = []
+            for symbol, info in recent_signals:
+                recent_list.append(f"{symbol}: {info['days_since']}日前")
+            
+            embed.add_field(
+                name="最近のシグナル",
+                value="\n".join(recent_list),
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+
 
 @bot.command(name="toggle")
 @commands.has_permissions(administrator=True)
@@ -1378,6 +1447,7 @@ async def toggle_alerts(ctx, alert_type: str = None):
         await ctx.send(f"✅ 戦略2アラートを{'ON' if POST_STRATEGY2_ALERTS else 'OFF'}にしました")
     else:
         await ctx.send("❌ 無効なタイプです。`summary`, `s1`, `s2` のいずれかを指定してください。")
+
 
 # メイン実行
 if __name__ == "__main__":
