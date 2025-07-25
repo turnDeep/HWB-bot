@@ -63,7 +63,7 @@ POST_STRATEGY2_ALERTS = parse_bool_env("POST_STRATEGY2_ALERTS", False)
 # 処理最適化パラメータ
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 20))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
-CACHE_EXPIRY_HOURS = 12
+CACHE_EXPIRY_HOURS = int(os.getenv("CACHE_EXPIRY_HOURS", 24))  # 修正2: デフォルトを24時間に変更
 
 # グローバル変数
 watched_symbols = set()
@@ -72,6 +72,7 @@ fvg_alerts = {}
 breakout_alerts = {}
 server_configs = {}
 data_cache = {}
+recent_signals_history = {}  # 直近シグナル履歴を保存する新しい変数
 
 # タイムゾーン設定
 ET = pytz.timezone("US/Eastern")
@@ -257,6 +258,45 @@ def get_nasdaq_nyse_symbols() -> Set[str]:
         return set(["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"])
 
 
+def get_business_days_ago(days: int) -> pd.Timestamp:
+    """指定された営業日前の日付を取得"""
+    current_date = pd.Timestamp.now(tz=ET).normalize()
+    business_days_count = 0
+    
+    while business_days_count < days:
+        current_date -= pd.Timedelta(days=1)
+        # 平日（月曜日=0, 金曜日=4）の場合のみカウント
+        if current_date.weekday() < 5:
+            business_days_count += 1
+    
+    return current_date.tz_localize(None)
+
+
+def update_recent_signals_history(alerts: List[Dict]):
+    """直近シグナル履歴を更新（修正4用）"""
+    global recent_signals_history
+    
+    today = pd.Timestamp.now().normalize()
+    
+    # 古いエントリを削除（3営業日より前のもの）
+    three_business_days_ago = get_business_days_ago(3)
+    recent_signals_history = {
+        date: symbols for date, symbols in recent_signals_history.items()
+        if pd.Timestamp(date) >= three_business_days_ago
+    }
+    
+    # 今日のシグナルを追加
+    today_str = today.strftime('%Y-%m-%d')
+    today_s2_symbols = set()
+    
+    for alert in alerts:
+        if alert['signal_type'] == 's2_breakout':
+            today_s2_symbols.add(alert['symbol'])
+    
+    if today_s2_symbols:
+        recent_signals_history[today_str] = today_s2_symbols
+
+
 class HWBAnalyzer:
     """HWB戦略の分析クラス（最適化版）"""
     
@@ -336,7 +376,7 @@ class HWBAnalyzer:
     
     @staticmethod
     def check_single_symbol_rule1(symbol: str) -> Tuple[str, bool]:
-        """単一銘柄のルール①チェック（同期版）"""
+        """単一銘柄のルール①チェック（同期版）- 修正1: 日足条件を追加"""
         try:
             cache_key = datetime.now().strftime("%Y%m%d")
             df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
@@ -354,14 +394,26 @@ class HWBAnalyzer:
             latest = df_daily.iloc[-1]
             
             # 週足終値が週足200SMAを上回っているかチェック
-            passed = (pd.notna(latest['Weekly_SMA200']) and 
-                     pd.notna(latest['Weekly_Close']) and 
-                     latest['Weekly_Close'] > latest['Weekly_SMA200'])
+            weekly_condition = (pd.notna(latest['Weekly_SMA200']) and 
+                               pd.notna(latest['Weekly_Close']) and 
+                               latest['Weekly_Close'] > latest['Weekly_SMA200'])
+            
+            # 修正1: 日足で日足200SMAと日足200EMAどちらも下回っている銘柄を除外
+            # つまり、日足終値が日足200SMAまたは日足200EMAのいずれかを上回っている必要がある
+            daily_condition = (pd.notna(latest['SMA200']) and 
+                              pd.notna(latest['EMA200']) and 
+                              (latest['Close'] > latest['SMA200'] or latest['Close'] > latest['EMA200']))
+            
+            # 両方の条件を満たす必要がある
+            passed = weekly_condition and daily_condition
             
             # デバッグ情報
             if symbol in ["AAPL", "NVDA", "TSLA"]:  # デバッグ用
                 print(f"{symbol} - Weekly Close: {latest.get('Weekly_Close', 'N/A'):.2f}, "
                       f"Weekly SMA200: {latest.get('Weekly_SMA200', 'N/A'):.2f}, "
+                      f"Daily Close: {latest.get('Close', 'N/A'):.2f}, "
+                      f"Daily SMA200: {latest.get('SMA200', 'N/A'):.2f}, "
+                      f"Daily EMA200: {latest.get('EMA200', 'N/A'):.2f}, "
                       f"Passed: {passed}")
             
             return symbol, passed
@@ -852,12 +904,32 @@ async def scan_all_symbols_optimized():
 
 
 def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
-    """サマリーEmbed作成"""
-    # 戦略2のティッカーを先に抽出
-    strategy2_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's2_breakout']))
+    """サマリーEmbed作成（修正4: 3つのカテゴリに拡張）"""
+    # 戦略2のティッカーを抽出（当日シグナル）
+    today_s2_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's2_breakout']))
     
-    # 戦略1のティッカーから戦略2のティッカーを除外
-    strategy1_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's1_fvg_detected' and a['symbol'] not in strategy2_tickers]))
+    # 戦略1のティッカーから戦略2のティッカーを除外（監視候補）
+    strategy1_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's1_fvg_detected' and a['symbol'] not in today_s2_tickers]))
+    
+    # 直近シグナル（1-3営業日前）を取得
+    recent_signal_tickers = []
+    today = pd.Timestamp.now().normalize()
+    for date_str, symbols in recent_signals_history.items():
+        signal_date = pd.Timestamp(date_str)
+        business_days_diff = 0
+        current_date = today
+        
+        # 営業日数を計算
+        while current_date > signal_date:
+            current_date -= pd.Timedelta(days=1)
+            if current_date.weekday() < 5:  # 平日
+                business_days_diff += 1
+        
+        if 1 <= business_days_diff <= 3:
+            recent_signal_tickers.extend(symbols)
+    
+    # 重複を除去して、今日のシグナルは除外
+    recent_signal_tickers = list(set(recent_signal_tickers) - set(today_s2_tickers))
     
     embed = discord.Embed(
         title="AI判定システム",
@@ -894,31 +966,60 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
             inline=False
         )
     
-    # シグナル（戦略2）
-    if strategy2_tickers:
-        tickers_str = ', '.join(sorted(strategy2_tickers))
+    # 当日シグナル（戦略2）
+    if today_s2_tickers:
+        tickers_str = ', '.join(sorted(today_s2_tickers))
         # Discordのフィールド値制限（1024文字）を考慮
         if len(tickers_str) > 1000:
             # 文字数制限を超える場合は省略
             tickers_list = []
             current_length = 0
-            for ticker in sorted(strategy2_tickers):
+            for ticker in sorted(today_s2_tickers):
                 if current_length + len(ticker) + 2 < 980:  # カンマとスペースを考慮
                     tickers_list.append(ticker)
                     current_length += len(ticker) + 2
                 else:
-                    tickers_list.append(f"... 他{len(strategy2_tickers) - len(tickers_list)}銘柄")
+                    tickers_list.append(f"... 他{len(today_s2_tickers) - len(tickers_list)}銘柄")
                     break
             tickers_str = ', '.join(tickers_list)
         
         embed.add_field(
-            name="🚀 シグナル",
+            name="🚀 当日シグナル",
             value=tickers_str,
             inline=False
         )
     else:
         embed.add_field(
-            name="🚀 シグナル",
+            name="🚀 当日シグナル",
+            value="なし",
+            inline=False
+        )
+    
+    # 直近シグナル（３営業日以内）
+    if recent_signal_tickers:
+        tickers_str = ', '.join(sorted(recent_signal_tickers))
+        # Discordのフィールド値制限（1024文字）を考慮
+        if len(tickers_str) > 1000:
+            # 文字数制限を超える場合は省略
+            tickers_list = []
+            current_length = 0
+            for ticker in sorted(recent_signal_tickers):
+                if current_length + len(ticker) + 2 < 980:  # カンマとスペースを考慮
+                    tickers_list.append(ticker)
+                    current_length += len(ticker) + 2
+                else:
+                    tickers_list.append(f"... 他{len(recent_signal_tickers) - len(tickers_list)}銘柄")
+                    break
+            tickers_str = ', '.join(tickers_list)
+        
+        embed.add_field(
+            name="📈 直近シグナル（３営業日以内）",
+            value=tickers_str,
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="📈 直近シグナル（３営業日以内）",
             value="なし",
             inline=False
         )
@@ -929,7 +1030,10 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
 
 
 async def post_alerts(channel, alerts: List[Dict]):
-    """アラートを投稿"""
+    """アラートを投稿（修正5: 当日シグナルは必ずアラートも出す）"""
+    # 履歴を更新
+    update_recent_signals_history(alerts)
+    
     # サマリーの投稿（POST_SUMMARYがTrueの場合）
     if POST_SUMMARY:
         if not alerts:
@@ -941,7 +1045,8 @@ async def post_alerts(channel, alerts: List[Dict]):
                 timestamp=datetime.now()
             )
             no_signal_embed.add_field(name="📍 監視候補", value="なし", inline=False)
-            no_signal_embed.add_field(name="🚀 シグナル", value="なし", inline=False)
+            no_signal_embed.add_field(name="🚀 当日シグナル", value="なし", inline=False)
+            no_signal_embed.add_field(name="📈 直近シグナル（３営業日以内）", value="なし", inline=False)
             no_signal_embed.set_footer(text="AI Trading Analysis System")
             await channel.send(embed=no_signal_embed)
         else:
@@ -949,90 +1054,90 @@ async def post_alerts(channel, alerts: List[Dict]):
             summary_embed = create_summary_embed(alerts)
             await channel.send(embed=summary_embed)
     
-    # 個別アラートの投稿（該当する設定がONの場合のみ）
-    if POST_STRATEGY1_ALERTS or POST_STRATEGY2_ALERTS:
-        # 銘柄ごとにアラートをグループ化
-        alerts_by_symbol = {}
-        for alert in alerts:
-            symbol = alert['symbol']
-            if symbol not in alerts_by_symbol:
-                alerts_by_symbol[symbol] = []
-            alerts_by_symbol[symbol].append(alert)
+    # 個別アラートの投稿
+    # 修正5: 当日シグナル（戦略2）は設定に関わらず常に出す
+    # 銘柄ごとにアラートをグループ化
+    alerts_by_symbol = {}
+    for alert in alerts:
+        symbol = alert['symbol']
+        if symbol not in alerts_by_symbol:
+            alerts_by_symbol[symbol] = []
+        alerts_by_symbol[symbol].append(alert)
+    
+    # 戦略2のアラートを持つ銘柄を特定
+    s2_symbols = set()
+    for symbol, symbol_alerts in alerts_by_symbol.items():
+        if any(a['signal_type'] == 's2_breakout' for a in symbol_alerts):
+            s2_symbols.add(symbol)
+    
+    posted_count = 0
+    max_individual_alerts = 30
+    
+    for symbol, symbol_alerts in alerts_by_symbol.items():
+        if posted_count >= max_individual_alerts:
+            break
         
-        # 戦略2のアラートを持つ銘柄を特定
-        s2_symbols = set()
-        for symbol, symbol_alerts in alerts_by_symbol.items():
-            if any(a['signal_type'] == 's2_breakout' for a in symbol_alerts):
-                s2_symbols.add(symbol)
+        # 戦略1と戦略2のアラートを分離
+        s1_alerts = [a for a in symbol_alerts if a['signal_type'] == 's1_fvg_detected']
+        s2_alerts = [a for a in symbol_alerts if a['signal_type'] == 's2_breakout']
         
-        posted_count = 0
-        max_individual_alerts = 30
+        # 戦略2アラート（ブレイクアウト）- 修正5: 常に投稿
+        if s2_alerts:
+            try:
+                embed = create_simple_s2_embed(symbol, s2_alerts)
+                
+                # 最新のブレイクアウト情報を取得
+                latest_breakout = None
+                for alert in s2_alerts:
+                    if 'breakout' in alert:
+                        latest_breakout = alert['breakout']
+                
+                # チャート作成（ブレイクアウト情報付き）
+                chart = HWBAnalyzer.create_hwb_chart(
+                    symbol,
+                    show_breakout_marker=True,
+                    breakout_info=latest_breakout  # ブレイクアウト情報を渡す
+                )
+                
+                if chart:
+                    file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
+                    embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
+                    await channel.send(embed=embed, file=file)
+                else:
+                    await channel.send(embed=embed)
+                
+                posted_count += 1
+                
+            except Exception as e:
+                print(f"戦略2アラート送信エラー ({symbol}): {e}")
         
-        for symbol, symbol_alerts in alerts_by_symbol.items():
-            if posted_count >= max_individual_alerts:
-                break
-            
-            # 戦略1と戦略2のアラートを分離
-            s1_alerts = [a for a in symbol_alerts if a['signal_type'] == 's1_fvg_detected']
-            s2_alerts = [a for a in symbol_alerts if a['signal_type'] == 's2_breakout']
-            
-            # 戦略2アラート（ブレイクアウト）
-            if s2_alerts and POST_STRATEGY2_ALERTS:
-                try:
-                    embed = create_simple_s2_embed(symbol, s2_alerts)
-                    
-                    # 最新のブレイクアウト情報を取得
-                    latest_breakout = None
-                    for alert in s2_alerts:
-                        if 'breakout' in alert:
-                            latest_breakout = alert['breakout']
-                    
-                    # チャート作成（ブレイクアウト情報付き）
-                    chart = HWBAnalyzer.create_hwb_chart(
-                        symbol,
-                        show_breakout_marker=True,
-                        breakout_info=latest_breakout  # ブレイクアウト情報を渡す
-                    )
-                    
-                    if chart:
-                        file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
-                        embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
-                        await channel.send(embed=embed, file=file)
-                    else:
-                        await channel.send(embed=embed)
-                    
-                    posted_count += 1
-                    
-                except Exception as e:
-                    print(f"戦略2アラート送信エラー ({symbol}): {e}")
-            
-            # 戦略1アラート（FVG検出）- 戦略2がない場合のみ
-            elif s1_alerts and POST_STRATEGY1_ALERTS and symbol not in s2_symbols:
-                try:
-                    embed = create_simple_s1_embed(symbol, s1_alerts)
-                    
-                    # チャート作成（マーカーなし）
-                    chart = HWBAnalyzer.create_hwb_chart(
-                        symbol,
-                        show_breakout_marker=False  # マーカーなし
-                    )
-                    
-                    if chart:
-                        file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
-                        embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
-                        await channel.send(embed=embed, file=file)
-                    else:
-                        await channel.send(embed=embed)
-                    
-                    posted_count += 1
-                    
-                except Exception as e:
-                    print(f"戦略1アラート送信エラー ({symbol}): {e}")
-        
-        # 投稿上限に達した場合の通知
-        if posted_count >= max_individual_alerts and len(alerts_by_symbol) > max_individual_alerts:
-            remaining = len(alerts_by_symbol) - max_individual_alerts
-            await channel.send(f"📋 他に{remaining}銘柄のアラートがありますが、投稿上限に達しました。")
+        # 戦略1アラート（FVG検出）- 設定がONの場合のみ
+        elif s1_alerts and POST_STRATEGY1_ALERTS and symbol not in s2_symbols:
+            try:
+                embed = create_simple_s1_embed(symbol, s1_alerts)
+                
+                # チャート作成（マーカーなし）
+                chart = HWBAnalyzer.create_hwb_chart(
+                    symbol,
+                    show_breakout_marker=False  # マーカーなし
+                )
+                
+                if chart:
+                    file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
+                    embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
+                    await channel.send(embed=embed, file=file)
+                else:
+                    await channel.send(embed=embed)
+                
+                posted_count += 1
+                
+            except Exception as e:
+                print(f"戦略1アラート送信エラー ({symbol}): {e}")
+    
+    # 投稿上限に達した場合の通知
+    if posted_count >= max_individual_alerts and len(alerts_by_symbol) > max_individual_alerts:
+        remaining = len(alerts_by_symbol) - max_individual_alerts
+        await channel.send(f"📋 他に{remaining}銘柄のアラートがありますが、投稿上限に達しました。")
 
 
 # Bot イベント
@@ -1047,7 +1152,7 @@ async def on_ready():
     print("\n投稿設定:")
     print(f"  サマリー: {'ON' if POST_SUMMARY else 'OFF'}")
     print(f"  戦略1アラート: {'ON' if POST_STRATEGY1_ALERTS else 'OFF'}")
-    print(f"  戦略2アラート: {'ON' if POST_STRATEGY2_ALERTS else 'OFF'}")
+    print(f"  戦略2アラート: {'ON' if POST_STRATEGY2_ALERTS else 'OFF'}（当日シグナルは常に投稿）")
     print(f"  シグナル冷却期間: {signal_manager.cooling_period}日")
     
     # キャッシュディレクトリを作成
@@ -1088,6 +1193,13 @@ async def daily_scan():
         daily_scan.last_scan_date = today_key
         
         print(f"日次スキャン開始: {now_et}")
+        
+        # 修正3: スキャン前にキャッシュをクリア
+        global data_cache
+        cache_size = len(data_cache)
+        data_cache.clear()
+        HWBAnalyzer.get_cached_stock_data.cache_clear()  # LRUキャッシュもクリア
+        print(f"キャッシュをクリアしました（{cache_size}件）")
         
         # 処理時間を計測
         start_time = datetime.now()
@@ -1160,6 +1272,7 @@ async def bot_status(ctx):
     post_settings.append(f"サマリー: {'✅' if POST_SUMMARY else '❌'}")
     post_settings.append(f"戦略1: {'✅' if POST_STRATEGY1_ALERTS else '❌'}")
     post_settings.append(f"戦略2: {'✅' if POST_STRATEGY2_ALERTS else '❌'}")
+    post_settings.append(f"※当日シグナルは常に投稿")
     
     embed.add_field(
         name="投稿設定",
@@ -1171,7 +1284,7 @@ async def bot_status(ctx):
     cache_size = len(data_cache)
     embed.add_field(
         name="キャッシュ",
-        value=f"{cache_size} 銘柄",
+        value=f"{cache_size} 銘柄\n有効期限: {CACHE_EXPIRY_HOURS}時間",
         inline=True
     )
     
@@ -1194,6 +1307,13 @@ async def bot_status(ctx):
 async def manual_scan(ctx):
     """手動でスキャンを実行（管理者のみ）"""
     await ctx.send("📡 手動スキャンを開始します... (時間がかかる場合があります)")
+    
+    # 修正3: スキャン前にキャッシュをクリア
+    global data_cache
+    cache_size = len(data_cache)
+    data_cache.clear()
+    HWBAnalyzer.get_cached_stock_data.cache_clear()  # LRUキャッシュもクリア
+    await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
     
     # デバッグモード有効化メッセージ
     await ctx.send("📊 デバッグモードで実行中（NVDA、AAPL、MSFTの詳細情報を表示）")
@@ -1238,7 +1358,7 @@ async def check_symbol(ctx, symbol: str):
         # まずルール①をチェック
         rule1_results = await HWBAnalyzer.batch_check_rule1_async([symbol])
         if not rule1_results.get(symbol, False):
-            await ctx.send(f"{symbol} はルール①（週足トレンド）を満たしていません。")
+            await ctx.send(f"{symbol} はルール①（週足トレンド条件または日足MA条件）を満たしていません。")
             return
         
         # シグナル履歴の確認（情報表示用）
@@ -1399,6 +1519,7 @@ async def clear_cache(ctx):
     global data_cache
     cache_size = len(data_cache)
     data_cache.clear()
+    HWBAnalyzer.get_cached_stock_data.cache_clear()  # LRUキャッシュもクリア
     await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
 
 
@@ -1408,7 +1529,13 @@ async def clear_history(ctx):
     """シグナル履歴をクリア（管理者のみ）"""
     history_size = len(signal_manager.signal_history)
     signal_manager.signal_history.clear()
-    await ctx.send(f"✅ シグナル履歴をクリアしました（{history_size}件）")
+    
+    # 直近シグナル履歴もクリア
+    global recent_signals_history
+    recent_history_size = len(recent_signals_history)
+    recent_signals_history.clear()
+    
+    await ctx.send(f"✅ シグナル履歴をクリアしました（{history_size}件）\n✅ 直近シグナル履歴もクリアしました（{recent_history_size}件）")
 
 
 @bot.command(name="history")
@@ -1531,6 +1658,11 @@ async def toggle_alerts(ctx, alert_type: str = None):
                   "`!toggle s2` - 戦略2アラートの切り替え",
             inline=False
         )
+        embed.add_field(
+            name="注意",
+            value="※当日シグナル（戦略2）は設定に関わらず常に個別投稿されます",
+            inline=False
+        )
         await ctx.send(embed=embed)
         return
     
@@ -1544,7 +1676,7 @@ async def toggle_alerts(ctx, alert_type: str = None):
         await ctx.send(f"✅ 戦略1アラートを{'ON' if POST_STRATEGY1_ALERTS else 'OFF'}にしました")
     elif alert_type in ["s2", "strategy2", "2"]:
         POST_STRATEGY2_ALERTS = not POST_STRATEGY2_ALERTS
-        await ctx.send(f"✅ 戦略2アラートを{'ON' if POST_STRATEGY2_ALERTS else 'OFF'}にしました")
+        await ctx.send(f"✅ 戦略2アラートを{'ON' if POST_STRATEGY2_ALERTS else 'OFF'}にしました\n※ただし、当日シグナルは常に投稿されます")
     else:
         await ctx.send("❌ 無効なタイプです。`summary`, `s1`, `s2` のいずれかを指定してください。")
 
