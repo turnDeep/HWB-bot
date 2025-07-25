@@ -1211,8 +1211,9 @@ async def check_symbol(ctx, symbol: str):
             await ctx.send(f"{symbol} はルール①（週足トレンド）を満たしていません。")
             return
         
-        # シグナル履歴の確認
+        # シグナル履歴の確認（情報表示用）
         history_info = ""
+        current_signal_active = False
         if symbol in signal_manager.signal_history:
             status = signal_manager.signal_history[symbol]
             last_signal = status.get('last_signal_date')
@@ -1226,46 +1227,79 @@ async def check_symbol(ctx, symbol: str):
                 
                 if days_since < signal_manager.cooling_period:
                     history_info += f"- 状態: 冷却期間中（あと{signal_manager.cooling_period - days_since}日）"
+                    # 0日前の場合は現在シグナル発生中
+                    if days_since == 0:
+                        current_signal_active = True
                 else:
                     history_info += f"- 状態: ✅ 新規シグナル可能"
         
-        # ルール②③④をチェック（シグナルマネージャーのチェックを適用）
-        results = await HWBAnalyzer.check_remaining_rules_async(symbol)
+        # ルール②③④をチェック（個別チェックでは履歴を無視）
+        # check_remaining_rules_asyncを直接呼び出すのではなく、内部メソッドを修正
+        cache_key = datetime.now().strftime("%Y%m%d")
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
         
-        if not results:
-            # 除外理由を確認
-            excluded_setups = []
-            cache_key = datetime.now().strftime("%Y%m%d")
-            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
-            
-            if df_daily is not None:
-                df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
-                setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
-                
-                for setup in setups:
-                    reason = signal_manager.get_excluded_reason(symbol, setup['date'])
-                    if reason:
-                        excluded_setups.append(f"- {setup['date'].strftime('%Y-%m-%d')}: {reason}")
-            
-            msg = f"該当なし - {symbol} は現在の条件を満たしていません。"
-            if excluded_setups:
-                msg += f"\n\n除外されたセットアップ:\n" + "\n".join(excluded_setups)
-            msg += history_info
-            
-            await ctx.send(msg)
+        if df_daily is None or df_weekly is None:
+            await ctx.send(f"エラー: {symbol} のデータ取得に失敗しました。")
             return
         
-        # 結果表示
-        await ctx.send(f"✅ {symbol} は以下の条件を満たしています：{history_info}")
+        df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
         
-        # 銘柄ごとにアラートをグループ化
-        s1_alerts = [r for r in results if r['signal_type'] == 's1_fvg_detected']
-        s2_alerts = [r for r in results if r['signal_type'] == 's2_breakout']
+        # セットアップを検出（履歴チェックなし）
+        setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
+        if not setups:
+            await ctx.send(f"該当なし - {symbol} は現在セットアップ条件（ルール②）を満たしていません。{history_info}")
+            return
         
-        # 戦略2アラートがある場合は戦略2のみ表示
-        if s2_alerts:
-            embed = create_simple_s2_embed(symbol, s2_alerts)
-            # ブレイクアウトマーカー付きチャート
+        # 各セットアップに対してFVGとブレイクアウトをチェック
+        all_results = []
+        excluded_setups = []
+        
+        for setup in setups:
+            setup_date = setup['date']
+            
+            # 履歴情報を収集（表示用）
+            reason = signal_manager.get_excluded_reason(symbol, setup_date)
+            if reason:
+                excluded_setups.append(f"- {setup_date.strftime('%Y-%m-%d')}: {reason}")
+            
+            # FVG検出
+            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup_date)
+            
+            for fvg in fvgs:
+                # ブレイクアウトチェック
+                breakout = HWBAnalyzer.check_breakout(df_daily, setup, fvg)
+                
+                if fvg:  # FVGが検出された
+                    result = {
+                        'symbol': symbol,
+                        'signal_type': 's1_fvg_detected',
+                        'setup': setup,
+                        'fvg': fvg,
+                        'current_price': df_daily['Close'].iloc[-1],
+                        'daily_ma200': df_daily['SMA200'].iloc[-1],
+                        'weekly_sma200': df_daily['Weekly_SMA200'].iloc[-1]
+                    }
+                    
+                    if breakout:  # ブレイクアウトも発生
+                        result['signal_type'] = 's2_breakout'
+                        result['breakout'] = breakout
+                    
+                    all_results.append(result)
+        
+        # 現在の条件を満たすシグナルがあるかチェック
+        current_s2_signals = [r for r in all_results if r['signal_type'] == 's2_breakout']
+        current_s1_signals = [r for r in all_results if r['signal_type'] == 's1_fvg_detected']
+        
+        # 結果の表示
+        if current_s2_signals:
+            # 現在ブレイクアウト条件を満たしている
+            status_msg = "✅ 現在ブレイクアウト条件を満たしています"
+            if current_signal_active:
+                status_msg += "（本日シグナル発生済み）"
+            await ctx.send(f"{status_msg}{history_info}")
+            
+            # 戦略2のEmbed表示
+            embed = create_simple_s2_embed(symbol, current_s2_signals)
             chart = HWBAnalyzer.create_hwb_chart(symbol, show_breakout_marker=True)
             if chart:
                 file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
@@ -1273,10 +1307,14 @@ async def check_symbol(ctx, symbol: str):
                 await ctx.send(embed=embed, file=file)
             else:
                 await ctx.send(embed=embed)
-        # 戦略2がない場合のみ戦略1を表示
-        elif s1_alerts:
-            embed = create_simple_s1_embed(symbol, s1_alerts)
-            # マーカーなしチャート
+                
+        elif current_s1_signals:
+            # FVG条件のみ満たしている
+            status_msg = "✅ 現在FVG条件を満たしています（ブレイクアウト待ち）"
+            await ctx.send(f"{status_msg}{history_info}")
+            
+            # 戦略1のEmbed表示
+            embed = create_simple_s1_embed(symbol, current_s1_signals)
             chart = HWBAnalyzer.create_hwb_chart(symbol, show_breakout_marker=False)
             if chart:
                 file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
@@ -1284,9 +1322,21 @@ async def check_symbol(ctx, symbol: str):
                 await ctx.send(embed=embed, file=file)
             else:
                 await ctx.send(embed=embed)
+                
+        else:
+            # 現在条件を満たしていない
+            msg = f"該当なし - {symbol} は現在の条件を満たしていません。"
+            if excluded_setups:
+                msg += f"\n\n除外されたセットアップ:\n" + "\n".join(excluded_setups[:10])
+                if len(excluded_setups) > 10:
+                    msg += f"\n...他{len(excluded_setups)-10}個"
+            msg += history_info
+            await ctx.send(msg)
             
     except Exception as e:
         await ctx.send(f"エラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @bot.command(name="clear_cache")
