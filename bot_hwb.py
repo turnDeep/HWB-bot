@@ -587,12 +587,10 @@ class HWBAnalyzer:
             return None
         
         # レジスタンス計算の改善
-        # セットアップ翌日からFVG形成日までの高値
         resistance_start_idx = setup_idx + 1
         resistance_end_idx = fvg_idx
         
         if resistance_end_idx <= resistance_start_idx:
-            # FVGがセットアップ直後の場合、セットアップ前の高値も含める
             resistance_start_idx = max(0, setup_idx - 10)
             resistance_end_idx = setup_idx + 1
         
@@ -601,25 +599,35 @@ class HWBAnalyzer:
         # 現在の価格
         current = df_daily.iloc[-1]
         
-        # FVG下限がサポートとして機能しているか
-        post_fvg_lows = df_daily.iloc[fvg_idx + 1:]['Low']
-        if len(post_fvg_lows) > 0 and (post_fvg_lows < fvg_lower).any():
-            return None  # FVGが破られた
+        # FVG下限がサポートとして機能しているか（最新日まで）
+        post_fvg_data = df_daily.iloc[fvg_idx + 1:]
+        if len(post_fvg_data) > 0:
+            min_low = post_fvg_data['Low'].min()
+            if min_low < fvg_lower:
+                return None  # FVGが破られた
         
-        # ブレイクアウト確認（現在の終値のみをチェック）
+        # ブレイクアウト確認（現在の終値が明確にレジスタンスを上回っている）
         if current['Close'] > resistance_high * (1 + BREAKOUT_THRESHOLD):
+            # デバッグ情報
+            print(f"{df_daily.index[-1].strftime('%Y-%m-%d')} - {setup['date'].strftime('%Y-%m-%d')} setup, "
+                  f"Resistance: ${resistance_high:.2f}, Current: ${current['Close']:.2f}, "
+                  f"Breakout: {current['Close'] > resistance_high * 1.001}")
+            
             return {
                 'breakout_date': df_daily.index[-1],
                 'breakout_price': current['Close'],
                 'resistance_price': resistance_high,
                 'setup_info': setup,
-                'fvg_info': fvg
+                'fvg_info': fvg,
+                'breakout_percentage': (current['Close'] / resistance_high - 1) * 100
             }
         
         return None
     
     @staticmethod
-    def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, save_path: str = None, show_breakout_marker: bool = True) -> Optional[BytesIO]:
+    def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, 
+                        save_path: str = None, show_breakout_marker: bool = True, 
+                        breakout_info: Dict = None) -> Optional[BytesIO]:
         """HWB戦略のチャートを作成（凡例なし、ブレイクアウトマーカーのみ表示）"""
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
@@ -661,25 +669,28 @@ class HWBAnalyzer:
         
         ax = axes[0]
         
-        # ブレイクアウトマーカーを表示する場合のみ（シグナル検出時）
-        if show_breakout_marker and 'breakout_price' in locals():
-            # 最新のローソク足にマーカーを表示
-            latest_idx = len(df_plot) - 1
-            latest_price = df_plot.iloc[-1]['Close']
-            
-            # 青い上向き矢印をローソク足の少し下に配置
-            marker_price = latest_price * 0.98  # 2%下に配置
-            ax.scatter(
-                latest_idx,
-                marker_price,
-                marker='^',
-                color='blue',
-                s=200,  # サイズ
-                zorder=5
-            )
+        # ブレイクアウトマーカーを表示する場合のみ（breakout_infoが提供されている場合）
+        if show_breakout_marker and breakout_info:
+            # ブレイクアウト日を確認
+            breakout_date = breakout_info.get('breakout_date')
+            if breakout_date and breakout_date in df_plot.index:
+                # ブレイクアウト日が最新日の場合のみマーカーを表示
+                if breakout_date == df_plot.index[-1]:
+                    latest_idx = len(df_plot) - 1
+                    latest_price = df_plot.iloc[-1]['Close']
+                    
+                    # 青い上向き矢印をローソク足の少し下に配置
+                    marker_price = latest_price * 0.98  # 2%下に配置
+                    ax.scatter(
+                        latest_idx,
+                        marker_price,
+                        marker='^',
+                        color='blue',
+                        s=200,  # サイズ
+                        zorder=5
+                    )
         
         # 凡例は表示しない（削除）
-        # ax.legend() の行を削除
         
         if save_path:
             plt.savefig(save_path)
@@ -958,10 +969,17 @@ async def post_alerts(channel, alerts: List[Dict]):
                 try:
                     embed = create_simple_s2_embed(symbol, s2_alerts)
                     
-                    # チャート作成（ブレイクアウトマーカー付き）
+                    # 最新のブレイクアウト情報を取得
+                    latest_breakout = None
+                    for alert in s2_alerts:
+                        if 'breakout' in alert:
+                            latest_breakout = alert['breakout']
+                    
+                    # チャート作成（ブレイクアウト情報付き）
                     chart = HWBAnalyzer.create_hwb_chart(
                         symbol,
-                        show_breakout_marker=True  # ブレイクアウトマーカーを表示
+                        show_breakout_marker=True,
+                        breakout_info=latest_breakout  # ブレイクアウト情報を渡す
                     )
                     
                     if chart:
@@ -1234,7 +1252,6 @@ async def check_symbol(ctx, symbol: str):
                     history_info += f"- 状態: ✅ 新規シグナル可能"
         
         # ルール②③④をチェック（個別チェックでは履歴を無視）
-        # check_remaining_rules_asyncを直接呼び出すのではなく、内部メソッドを修正
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
         
@@ -1292,15 +1309,39 @@ async def check_symbol(ctx, symbol: str):
         
         # 結果の表示
         if current_s2_signals:
-            # 現在ブレイクアウト条件を満たしている
-            status_msg = "✅ 現在ブレイクアウト条件を満たしています"
+            # 最新のブレイクアウト情報を確認
+            latest_breakout = None
+            for signal in current_s2_signals:
+                if 'breakout' in signal and signal['breakout']:
+                    latest_breakout = signal['breakout']
+                    break
+            
+            # ブレイクアウトが本日発生しているか確認
+            is_today_breakout = False
+            if latest_breakout:
+                breakout_date = latest_breakout.get('breakout_date')
+                if breakout_date:
+                    today = datetime.now().date()
+                    is_today_breakout = breakout_date.date() == today
+            
+            # 状態メッセージを調整
+            if is_today_breakout:
+                status_msg = "✅ 本日ブレイクアウト条件を満たしました"
+            else:
+                status_msg = "✅ 過去にブレイクアウト条件を満たしています（現在は条件外の可能性）"
+            
             if current_signal_active:
-                status_msg += "（本日シグナル発生済み）"
+                status_msg += "（シグナル発生済み）"
+            
             await ctx.send(f"{status_msg}{history_info}")
             
             # 戦略2のEmbed表示
             embed = create_simple_s2_embed(symbol, current_s2_signals)
-            chart = HWBAnalyzer.create_hwb_chart(symbol, show_breakout_marker=True)
+            chart = HWBAnalyzer.create_hwb_chart(
+                symbol, 
+                show_breakout_marker=is_today_breakout,  # 本日のブレイクアウトのみマーカー表示
+                breakout_info=latest_breakout if is_today_breakout else None
+            )
             if chart:
                 file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
                 embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
