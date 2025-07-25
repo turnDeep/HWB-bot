@@ -619,8 +619,8 @@ class HWBAnalyzer:
         return None
     
     @staticmethod
-    def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, save_path: str = None, show_zones: bool = True) -> Optional[BytesIO]:
-        """HWB戦略のチャートを作成（ゾーン表示オプション付き）"""
+    def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, save_path: str = None, show_breakout_marker: bool = True) -> Optional[BytesIO]:
+        """HWB戦略のチャートを作成（凡例なし、ブレイクアウトマーカーのみ表示）"""
         cache_key = datetime.now().strftime("%Y%m%d")
         df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
         
@@ -629,14 +629,8 @@ class HWBAnalyzer:
         
         df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
         
-        # チャート表示期間を設定
-        if setup_date and show_zones:
-            center_date = pd.to_datetime(setup_date)
-            start_date = center_date - pd.Timedelta(days=90)
-            end_date = center_date + pd.Timedelta(days=90)
-            df_plot = df_daily[(df_daily.index >= start_date) & (df_daily.index <= end_date)].copy()
-        else:
-            df_plot = df_daily.tail(180).copy()
+        # チャート表示期間を設定（常に最新180日）
+        df_plot = df_daily.tail(180).copy()
         
         if len(df_plot) < 20:
             return None
@@ -667,24 +661,25 @@ class HWBAnalyzer:
         
         ax = axes[0]
         
-        # ゾーンを表示する場合のみ
-        if show_zones:
-            # セットアップゾーンをハイライト
-            if setup_date and setup_date in df_plot.index:
-                setup_idx = df_plot.index.get_loc(setup_date)
-                ax.axvspan(setup_idx - 0.5, setup_idx + 0.5, alpha=0.3, color='yellow', zorder=0)
+        # ブレイクアウトマーカーを表示する場合のみ（シグナル検出時）
+        if show_breakout_marker and 'breakout_price' in locals():
+            # 最新のローソク足にマーカーを表示
+            latest_idx = len(df_plot) - 1
+            latest_price = df_plot.iloc[-1]['Close']
             
-            # FVGを描画
-            if fvg_info and fvg_info['start_date'] in df_plot.index:
-                start_idx = df_plot.index.get_loc(fvg_info['start_date'])
-                rect = patches.Rectangle((start_idx - 0.5, fvg_info['lower_bound']), 
-                                         len(df_plot) - start_idx, 
-                                         fvg_info['upper_bound'] - fvg_info['lower_bound'],
-                                         linewidth=1, edgecolor='green', facecolor='green', alpha=0.2)
-                ax.add_patch(rect)
+            # 青い上向き矢印をローソク足の少し下に配置
+            marker_price = latest_price * 0.98  # 2%下に配置
+            ax.scatter(
+                latest_idx,
+                marker_price,
+                marker='^',
+                color='blue',
+                s=200,  # サイズ
+                zorder=5
+            )
         
-        # 凡例
-        ax.legend(['Daily SMA200', 'Daily EMA200', 'Weekly SMA200'], loc='upper left')
+        # 凡例は表示しない（削除）
+        # ax.legend() の行を削除
         
         if save_path:
             plt.savefig(save_path)
@@ -963,10 +958,10 @@ async def post_alerts(channel, alerts: List[Dict]):
                 try:
                     embed = create_simple_s2_embed(symbol, s2_alerts)
                     
-                    # チャート作成（ゾーンなし、週足SMA200付き）
+                    # チャート作成（ブレイクアウトマーカー付き）
                     chart = HWBAnalyzer.create_hwb_chart(
                         symbol,
-                        show_zones=False  # ゾーンを非表示
+                        show_breakout_marker=True  # ブレイクアウトマーカーを表示
                     )
                     
                     if chart:
@@ -986,10 +981,10 @@ async def post_alerts(channel, alerts: List[Dict]):
                 try:
                     embed = create_simple_s1_embed(symbol, s1_alerts)
                     
-                    # チャート作成（ゾーンなし、週足SMA200付き）
+                    # チャート作成（マーカーなし）
                     chart = HWBAnalyzer.create_hwb_chart(
                         symbol,
-                        show_zones=False  # ゾーンを非表示
+                        show_breakout_marker=False  # マーカーなし
                     )
                     
                     if chart:
@@ -1232,7 +1227,7 @@ async def check_symbol(ctx, symbol: str):
                 if days_since < signal_manager.cooling_period:
                     history_info += f"- 状態: 冷却期間中（あと{signal_manager.cooling_period - days_since}日）"
                 else:
-                    history_info += f"- 状態: 新規シグナル可能"
+                    history_info += f"- 状態: ✅ 新規シグナル可能"
         
         # ルール②③④をチェック（シグナルマネージャーのチェックを適用）
         results = await HWBAnalyzer.check_remaining_rules_async(symbol)
@@ -1270,7 +1265,8 @@ async def check_symbol(ctx, symbol: str):
         # 戦略2アラートがある場合は戦略2のみ表示
         if s2_alerts:
             embed = create_simple_s2_embed(symbol, s2_alerts)
-            chart = HWBAnalyzer.create_hwb_chart(symbol, show_zones=False)
+            # ブレイクアウトマーカー付きチャート
+            chart = HWBAnalyzer.create_hwb_chart(symbol, show_breakout_marker=True)
             if chart:
                 file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
                 embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
@@ -1280,7 +1276,8 @@ async def check_symbol(ctx, symbol: str):
         # 戦略2がない場合のみ戦略1を表示
         elif s1_alerts:
             embed = create_simple_s1_embed(symbol, s1_alerts)
-            chart = HWBAnalyzer.create_hwb_chart(symbol, show_zones=False)
+            # マーカーなしチャート
+            chart = HWBAnalyzer.create_hwb_chart(symbol, show_breakout_marker=False)
             if chart:
                 file = discord.File(chart, filename=f"{symbol}_hwb_chart.png")
                 embed.set_image(url=f"attachment://{symbol}_hwb_chart.png")
