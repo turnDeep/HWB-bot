@@ -92,9 +92,14 @@ class ImprovedSignalManager:
         self.signal_history = {}
         self.cooling_period = cooling_period
         
-    def should_process_setup(self, symbol: str, setup_date: pd.Timestamp) -> bool:
+    def should_process_setup(self, symbol: str, setup_date: pd.Timestamp, reference_date: datetime = None) -> bool:
         """
         セットアップを処理すべきか判断
+        
+        Parameters:
+        -----------
+        reference_date : datetime
+            基準日（デバッグモード用）。Noneの場合は現在日時を使用
         
         Returns:
         --------
@@ -114,7 +119,9 @@ class ImprovedSignalManager:
         # 2. 最新のシグナルから冷却期間をチェック
         last_signal_date = history.get('last_signal_date')
         if last_signal_date:
-            days_elapsed = (datetime.now() - last_signal_date).days
+            # 基準日を使用（デバッグモード対応）
+            ref_date = reference_date if reference_date else datetime.now()
+            days_elapsed = (ref_date - last_signal_date).days
             if days_elapsed < self.cooling_period:
                 # 冷却期間中でも、より新しいセットアップは評価
                 last_setup = history.get('last_setup_date')
@@ -124,8 +131,15 @@ class ImprovedSignalManager:
         
         return True
     
-    def record_signal(self, symbol: str, setup_date: pd.Timestamp):
-        """シグナル発生を記録"""
+    def record_signal(self, symbol: str, setup_date: pd.Timestamp, signal_date: datetime = None):
+        """
+        シグナル発生を記録
+        
+        Parameters:
+        -----------
+        signal_date : datetime
+            シグナル発生日（デバッグモード用）。Noneの場合は現在日時を使用
+        """
         if symbol not in self.signal_history:
             self.signal_history[symbol] = {
                 'completed_setups': [],
@@ -139,11 +153,18 @@ class ImprovedSignalManager:
         if setup_date not in history['completed_setups']:
             history['completed_setups'].append(setup_date)
         
-        history['last_signal_date'] = datetime.now()
+        history['last_signal_date'] = signal_date if signal_date else datetime.now()
         history['last_setup_date'] = setup_date
     
-    def get_excluded_reason(self, symbol: str, setup_date: pd.Timestamp) -> Optional[str]:
-        """除外理由を取得（デバッグ用）"""
+    def get_excluded_reason(self, symbol: str, setup_date: pd.Timestamp, reference_date: datetime = None) -> Optional[str]:
+        """
+        除外理由を取得（デバッグ用）
+        
+        Parameters:
+        -----------
+        reference_date : datetime
+            基準日（デバッグモード用）
+        """
         if symbol not in self.signal_history:
             return None
         
@@ -158,16 +179,24 @@ class ImprovedSignalManager:
         # 冷却期間中かチェック
         last_signal_date = history.get('last_signal_date')
         if last_signal_date:
-            days_elapsed = (datetime.now() - last_signal_date).days
+            ref_date = reference_date if reference_date else datetime.now()
+            days_elapsed = (ref_date - last_signal_date).days
             if days_elapsed < self.cooling_period:
                 return f"冷却期間中（あと{self.cooling_period - days_elapsed}日）"
         
         return None
     
-    def get_status_summary(self) -> Dict[str, Dict]:
-        """全銘柄のステータスサマリーを取得"""
+    def get_status_summary(self, reference_date: datetime = None) -> Dict[str, Dict]:
+        """
+        全銘柄のステータスサマリーを取得
+        
+        Parameters:
+        -----------
+        reference_date : datetime
+            基準日（デバッグモード用）
+        """
         summary = {}
-        now = datetime.now()
+        now = reference_date if reference_date else datetime.now()
         
         for symbol, history in self.signal_history.items():
             last_signal_date = history.get('last_signal_date')
@@ -258,9 +287,16 @@ def get_nasdaq_nyse_symbols() -> Set[str]:
         return set(["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"])
 
 
-def get_business_days_ago(days: int) -> pd.Timestamp:
-    """指定された営業日前の日付を取得"""
-    current_date = pd.Timestamp.now(tz=ET).normalize()
+def get_business_days_ago(days: int, reference_date: pd.Timestamp = None) -> pd.Timestamp:
+    """
+    指定された営業日前の日付を取得
+    
+    Parameters:
+    -----------
+    reference_date : pd.Timestamp
+        基準日（デバッグモード用）。Noneの場合は現在日時を使用
+    """
+    current_date = reference_date if reference_date else pd.Timestamp.now(tz=ET).normalize()
     business_days_count = 0
     
     while business_days_count < days:
@@ -272,14 +308,21 @@ def get_business_days_ago(days: int) -> pd.Timestamp:
     return current_date.tz_localize(None)
 
 
-def update_recent_signals_history(alerts: List[Dict]):
-    """直近シグナル履歴を更新（修正4用）"""
+def update_recent_signals_history(alerts: List[Dict], target_date: pd.Timestamp = None):
+    """
+    直近シグナル履歴を更新（修正4用）
+    
+    Parameters:
+    -----------
+    target_date : pd.Timestamp
+        対象日（デバッグモード用）
+    """
     global recent_signals_history
     
-    today = pd.Timestamp.now().normalize()
+    today = target_date if target_date else pd.Timestamp.now().normalize()
     
     # 古いエントリを削除（3営業日より前のもの）
-    three_business_days_ago = get_business_days_ago(3)
+    three_business_days_ago = get_business_days_ago(3, today)
     recent_signals_history = {
         date: symbols for date, symbols in recent_signals_history.items()
         if pd.Timestamp(date) >= three_business_days_ago
@@ -302,16 +345,24 @@ class HWBAnalyzer:
     
     @staticmethod
     @lru_cache(maxsize=1000)
-    def get_cached_stock_data(symbol: str, cache_key: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """キャッシュ付き株価データ取得"""
+    def get_cached_stock_data(symbol: str, cache_key: str, target_date: str = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """
+        キャッシュ付き株価データ取得
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）
+        """
         # キャッシュチェック
+        cache_key_with_date = f"{cache_key}_{target_date}" if target_date else cache_key
         if symbol in data_cache:
             cached_data, cache_time = data_cache[symbol]
             if datetime.now() - cache_time < timedelta(hours=CACHE_EXPIRY_HOURS):
                 return cached_data
         
         # データ取得
-        df_daily, df_weekly = HWBAnalyzer._fetch_stock_data(symbol)
+        df_daily, df_weekly = HWBAnalyzer._fetch_stock_data(symbol, target_date)
         
         # キャッシュに保存
         if df_daily is not None and df_weekly is not None:
@@ -320,20 +371,43 @@ class HWBAnalyzer:
         return df_daily, df_weekly
     
     @staticmethod
-    def _fetch_stock_data(symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        """実際のデータ取得処理"""
+    def _fetch_stock_data(symbol: str, target_date: str = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """
+        実際のデータ取得処理
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）。指定された場合、その日付までのデータを取得
+        """
         session = requests.Session(impersonate="safari15_5")
         try:
             stock = yf.Ticker(symbol, session=session)
             
-            # 日足データ（2年分）
-            df_daily = stock.history(period="2y", interval="1d")
+            # 終了日を設定
+            if target_date:
+                end_date = pd.Timestamp(target_date) + pd.Timedelta(days=1)  # 指定日を含む
+            else:
+                end_date = None
+            
+            # 日足データ（2年分または指定日まで）
+            if target_date:
+                start_date = pd.Timestamp(target_date) - pd.Timedelta(days=730)  # 2年前
+                df_daily = stock.history(start=start_date, end=end_date, interval="1d")
+            else:
+                df_daily = stock.history(period="2y", interval="1d")
+                
             if df_daily.empty or len(df_daily) < 200:
                 return None, None
             df_daily.index = df_daily.index.tz_localize(None)
             
-            # 週足データ（5年分）
-            df_weekly = stock.history(period="5y", interval="1wk")
+            # 週足データ（5年分または指定日まで）
+            if target_date:
+                start_date = pd.Timestamp(target_date) - pd.Timedelta(days=1825)  # 5年前
+                df_weekly = stock.history(start=start_date, end=end_date, interval="1wk")
+            else:
+                df_weekly = stock.history(period="5y", interval="1wk")
+                
             if df_weekly.empty or len(df_weekly) < 200:
                 return None, None
             df_weekly.index = df_weekly.index.tz_localize(None)
@@ -375,11 +449,18 @@ class HWBAnalyzer:
         return df_daily, df_weekly
     
     @staticmethod
-    def check_single_symbol_rule1(symbol: str) -> Tuple[str, bool]:
-        """単一銘柄のルール①チェック（同期版）- 修正1: 日足条件を追加"""
+    def check_single_symbol_rule1(symbol: str, target_date: str = None) -> Tuple[str, bool]:
+        """
+        単一銘柄のルール①チェック（同期版）- 修正1: 日足条件を追加
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）
+        """
         try:
-            cache_key = datetime.now().strftime("%Y%m%d")
-            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+            cache_key = target_date if target_date else datetime.now().strftime("%Y%m%d")
+            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key, target_date)
             
             if df_daily is None or df_weekly is None:
                 return symbol, False
@@ -423,8 +504,15 @@ class HWBAnalyzer:
             return symbol, False
     
     @staticmethod
-    async def batch_check_rule1_async(symbols: List[str]) -> Dict[str, bool]:
-        """ルール①を複数銘柄に対して非同期バッチチェック"""
+    async def batch_check_rule1_async(symbols: List[str], target_date: str = None) -> Dict[str, bool]:
+        """
+        ルール①を複数銘柄に対して非同期バッチチェック
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）
+        """
         results = {}
         
         # ThreadPoolExecutorを使って同期関数を非同期で実行
@@ -437,7 +525,7 @@ class HWBAnalyzer:
             # 各バッチを並列処理
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = [
-                    loop.run_in_executor(executor, HWBAnalyzer.check_single_symbol_rule1, symbol)
+                    loop.run_in_executor(executor, HWBAnalyzer.check_single_symbol_rule1, symbol, target_date)
                     for symbol in batch
                 ]
                 
@@ -457,8 +545,15 @@ class HWBAnalyzer:
         return results
     
     @staticmethod
-    async def check_remaining_rules_async(symbol: str) -> List[Dict]:
-        """ルール②③④を非同期でチェック（改善版）"""
+    async def check_remaining_rules_async(symbol: str, target_date: str = None) -> List[Dict]:
+        """
+        ルール②③④を非同期でチェック（改善版）
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）
+        """
         loop = asyncio.get_event_loop()
         
         # ThreadPoolExecutorで同期関数を非同期実行
@@ -466,16 +561,24 @@ class HWBAnalyzer:
             result = await loop.run_in_executor(
                 executor,
                 HWBAnalyzer._check_remaining_rules_sync,
-                symbol
+                symbol,
+                target_date
             )
         
         return result
     
     @staticmethod
-    def _check_remaining_rules_sync(symbol: str) -> List[Dict]:
-        """ルール②③④の同期版チェック（改善版）"""
-        cache_key = datetime.now().strftime("%Y%m%d")
-        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+    def _check_remaining_rules_sync(symbol: str, target_date: str = None) -> List[Dict]:
+        """
+        ルール②③④の同期版チェック（改善版）
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）
+        """
+        cache_key = target_date if target_date else datetime.now().strftime("%Y%m%d")
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key, target_date)
         
         if df_daily is None or df_weekly is None:
             return []
@@ -489,14 +592,17 @@ class HWBAnalyzer:
         
         results = []
         
+        # デバッグモード用の基準日
+        reference_date = pd.Timestamp(target_date) if target_date else None
+        
         # 各セットアップに対してシグナルマネージャーでチェック
         for setup in setups:
             setup_date = setup['date']
             
             # このセットアップを処理すべきかチェック
-            if not signal_manager.should_process_setup(symbol, setup_date):
+            if not signal_manager.should_process_setup(symbol, setup_date, reference_date):
                 # デバッグ情報
-                reason = signal_manager.get_excluded_reason(symbol, setup_date)
+                reason = signal_manager.get_excluded_reason(symbol, setup_date, reference_date)
                 if symbol in ["NVDA", "AAPL", "MSFT"] and reason:
                     print(f"{symbol}: セットアップ {setup_date.strftime('%Y-%m-%d')} は除外 - {reason}")
                 continue
@@ -505,8 +611,8 @@ class HWBAnalyzer:
             fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup_date)
             
             for fvg in fvgs:
-                # ルール④ブレイクアウトチェック（当日のみ）
-                breakout = HWBAnalyzer.check_breakout(df_daily, setup, fvg, today_only=True)
+                # ルール④ブレイクアウトチェック（指定日のみ）
+                breakout = HWBAnalyzer.check_breakout(df_daily, setup, fvg, today_only=True, target_date=target_date)
                 
                 # 結果を収集
                 if fvg:  # FVGが検出された（戦略1）
@@ -525,7 +631,7 @@ class HWBAnalyzer:
                         result['breakout'] = breakout
                         
                         # シグナル履歴を更新（ブレイクアウト時のみ記録）
-                        signal_manager.record_signal(symbol, setup_date)
+                        signal_manager.record_signal(symbol, setup_date, reference_date)
                     
                     results.append(result)
         
@@ -621,7 +727,7 @@ class HWBAnalyzer:
         return sma_deviation <= FVG_ZONE_PROXIMITY or ema_deviation <= FVG_ZONE_PROXIMITY
     
     @staticmethod
-    def check_breakout(df_daily: pd.DataFrame, setup: Dict, fvg: Dict, today_only: bool = False) -> Optional[Dict]:
+    def check_breakout(df_daily: pd.DataFrame, setup: Dict, fvg: Dict, today_only: bool = False, target_date: str = None) -> Optional[Dict]:
         """
         ルール④: ブレイクアウト条件をチェック
         
@@ -629,6 +735,8 @@ class HWBAnalyzer:
         -----------
         today_only : bool
             Trueの場合、当日（最新日）のブレイクアウトのみを検出
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）。デバッグモード用
         """
         setup_date = setup['date']
         fvg_formation_date = fvg['formation_date']
@@ -639,6 +747,11 @@ class HWBAnalyzer:
             fvg_idx = df_daily.index.get_loc(fvg_formation_date)
         except KeyError:
             return None
+        
+        # デバッグモード時は指定日のデータまでを使用
+        if target_date:
+            target_timestamp = pd.Timestamp(target_date)
+            df_daily = df_daily[df_daily.index <= target_timestamp]
         
         # 最新データを確認
         latest_idx = len(df_daily) - 1
@@ -692,15 +805,27 @@ class HWBAnalyzer:
     @staticmethod
     def create_hwb_chart(symbol: str, setup_date: pd.Timestamp = None, fvg_info: Dict = None, 
                         save_path: str = None, show_breakout_marker: bool = True, 
-                        breakout_info: Dict = None) -> Optional[BytesIO]:
-        """HWB戦略のチャートを作成（凡例なし、ブレイクアウトマーカーのみ表示）"""
-        cache_key = datetime.now().strftime("%Y%m%d")
-        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+                        breakout_info: Dict = None, target_date: str = None) -> Optional[BytesIO]:
+        """
+        HWB戦略のチャートを作成（凡例なし、ブレイクアウトマーカーのみ表示）
+        
+        Parameters:
+        -----------
+        target_date : str
+            対象日（'YYYY-MM-DD'形式）。デバッグモード用
+        """
+        cache_key = target_date if target_date else datetime.now().strftime("%Y%m%d")
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key, target_date)
         
         if df_daily is None:
             return None
         
         df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+        
+        # デバッグモード時は指定日までのデータを使用
+        if target_date:
+            target_timestamp = pd.Timestamp(target_date)
+            df_daily = df_daily[df_daily.index <= target_timestamp]
         
         # チャート表示期間を設定（常に最新180日）
         df_plot = df_daily.tail(180).copy()
@@ -728,8 +853,13 @@ class HWBAnalyzer:
         if 'Weekly_SMA200' in df_plot.columns and not df_plot['Weekly_SMA200'].isna().all():
             apds.append(mpf.make_addplot(df_plot['Weekly_SMA200'], color='blue', width=3))
         
+        # チャートタイトルにデバッグモード情報を追加
+        title = f'{symbol} - HWB Strategy Analysis'
+        if target_date:
+            title += f' (Debug: {target_date})'
+        
         fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, addplot=apds,
-                             title=f'{symbol} - HWB Strategy Analysis', returnfig=True, 
+                             title=title, returnfig=True, 
                              figsize=(12, 8), panel_ratios=(3, 1))
         
         ax = axes[0]
@@ -828,8 +958,15 @@ async def setup_guild(guild):
         print(f"サーバー '{guild.name}' の設定完了。アラートチャンネル: #{alert_channel.name}")
 
 
-async def scan_all_symbols_optimized():
-    """最適化された全銘柄スキャン（改善版）"""
+async def scan_all_symbols_optimized(target_date: str = None):
+    """
+    最適化された全銘柄スキャン（改善版）
+    
+    Parameters:
+    -----------
+    target_date : str
+        対象日（'YYYY-MM-DD'形式）。デバッグモード用
+    """
     alerts = []
     
     # すべての銘柄を取得
@@ -837,11 +974,13 @@ async def scan_all_symbols_optimized():
     total = len(all_symbols)
     
     print(f"スキャン開始: {datetime.now()} - {total}銘柄")
+    if target_date:
+        print(f"デバッグモード: {target_date}時点のデータでスキャン")
     print("ステップ1: ルール①（週足トレンド）をチェック中...")
     
     # ステップ1: ルール①でフィルタリング（非同期バッチ処理）
     try:
-        rule1_results = await HWBAnalyzer.batch_check_rule1_async(all_symbols)
+        rule1_results = await HWBAnalyzer.batch_check_rule1_async(all_symbols, target_date)
         passed_rule1 = [symbol for symbol, passed in rule1_results.items() if passed]
         
         print(f"ルール①通過: {len(passed_rule1)}銘柄 ({len(passed_rule1)/total*100:.1f}%)")
@@ -861,7 +1000,7 @@ async def scan_all_symbols_optimized():
             batch = passed_rule1[i:i + BATCH_SIZE]
             
             # 各銘柄を非同期でチェック
-            tasks = [HWBAnalyzer.check_remaining_rules_async(symbol) for symbol in batch]
+            tasks = [HWBAnalyzer.check_remaining_rules_async(symbol, target_date) for symbol in batch]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
             for symbol, results in zip(batch, batch_results):
@@ -875,7 +1014,9 @@ async def scan_all_symbols_optimized():
                     if status:
                         excluded_count += 1
                         if status.get('last_signal_date'):
-                            days_since = (datetime.now() - status['last_signal_date']).days
+                            # デバッグモード用の基準日
+                            ref_date = pd.Timestamp(target_date) if target_date else datetime.now()
+                            days_since = (ref_date - status['last_signal_date']).days
                             if days_since < signal_manager.cooling_period:
                                 cooling_count += 1
                 
@@ -903,8 +1044,15 @@ async def scan_all_symbols_optimized():
     return alerts
 
 
-def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
-    """サマリーEmbed作成（修正4: 3つのカテゴリに拡張）"""
+def create_summary_embed(alerts: List[Dict], target_date: pd.Timestamp = None) -> discord.Embed:
+    """
+    サマリーEmbed作成（修正4: 3つのカテゴリに拡張）
+    
+    Parameters:
+    -----------
+    target_date : pd.Timestamp
+        対象日（デバッグモード用）
+    """
     # 戦略2のティッカーを抽出（当日シグナル）
     today_s2_tickers = list(set([a['symbol'] for a in alerts if a['signal_type'] == 's2_breakout']))
     
@@ -913,7 +1061,7 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     
     # 直近シグナル（1-3営業日前）を取得
     recent_signal_tickers = []
-    today = pd.Timestamp.now().normalize()
+    today = target_date if target_date else pd.Timestamp.now().normalize()
     for date_str, symbols in recent_signals_history.items():
         signal_date = pd.Timestamp(date_str)
         business_days_diff = 0
@@ -931,9 +1079,21 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     # 重複を除去して、今日のシグナルは除外
     recent_signal_tickers = list(set(recent_signal_tickers) - set(today_s2_tickers))
     
+    # デバッグモード用のタイトルとタイムスタンプ
+    if target_date:
+        title = "AI判定システム（デバッグモード）"
+        scan_time = target_date.strftime('%Y-%m-%d')
+        description = f"**デバッグ: {scan_time}時点のデータでスキャン**\n"
+    else:
+        title = "AI判定システム"
+        scan_time = datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')
+        description = ""
+    
+    description += f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {scan_time}"
+    
     embed = discord.Embed(
-        title="AI判定システム",
-        description=f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
+        title=title,
+        description=description,
         color=discord.Color.gold()
     )
     
@@ -1029,18 +1189,25 @@ def create_summary_embed(alerts: List[Dict]) -> discord.Embed:
     return embed
 
 
-async def post_alerts(channel, alerts: List[Dict]):
-    """アラートを投稿（修正5: 当日シグナルは必ずアラートも出す）"""
+async def post_alerts(channel, alerts: List[Dict], target_date: pd.Timestamp = None):
+    """
+    アラートを投稿（修正5: 当日シグナルは必ずアラートも出す）
+    
+    Parameters:
+    -----------
+    target_date : pd.Timestamp
+        対象日（デバッグモード用）
+    """
     # 履歴を更新
-    update_recent_signals_history(alerts)
+    update_recent_signals_history(alerts, target_date)
     
     # サマリーの投稿（POST_SUMMARYがTrueの場合）
     if POST_SUMMARY:
         if not alerts:
             # シグナルがない場合のサマリー
             no_signal_embed = discord.Embed(
-                title="AI判定システム",
-                description=f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
+                title="AI判定システム" + ("（デバッグモード）" if target_date else ""),
+                description=f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {target_date.strftime('%Y-%m-%d') if target_date else datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
                 color=discord.Color.grey(),
                 timestamp=datetime.now()
             )
@@ -1051,8 +1218,12 @@ async def post_alerts(channel, alerts: List[Dict]):
             await channel.send(embed=no_signal_embed)
         else:
             # シグナルがある場合のサマリー
-            summary_embed = create_summary_embed(alerts)
+            summary_embed = create_summary_embed(alerts, target_date)
             await channel.send(embed=summary_embed)
+    
+    # デバッグモードでは個別アラートは投稿しない
+    if target_date:
+        return
     
     # 個別アラートの投稿
     # 修正5: 当日シグナル（戦略2）は設定に関わらず常に出す
@@ -1096,7 +1267,8 @@ async def post_alerts(channel, alerts: List[Dict]):
                 chart = HWBAnalyzer.create_hwb_chart(
                     symbol,
                     show_breakout_marker=True,
-                    breakout_info=latest_breakout  # ブレイクアウト情報を渡す
+                    breakout_info=latest_breakout,  # ブレイクアウト情報を渡す
+                    target_date=target_date.strftime('%Y-%m-%d') if target_date else None
                 )
                 
                 if chart:
@@ -1119,7 +1291,8 @@ async def post_alerts(channel, alerts: List[Dict]):
                 # チャート作成（マーカーなし）
                 chart = HWBAnalyzer.create_hwb_chart(
                     symbol,
-                    show_breakout_marker=False  # マーカーなし
+                    show_breakout_marker=False,  # マーカーなし
+                    target_date=target_date.strftime('%Y-%m-%d') if target_date else None
                 )
                 
                 if chart:
@@ -1304,9 +1477,46 @@ async def bot_status(ctx):
 
 @bot.command(name="scan")
 @commands.has_permissions(administrator=True)
-async def manual_scan(ctx):
-    """手動でスキャンを実行（管理者のみ）"""
-    await ctx.send("📡 手動スキャンを開始します... (時間がかかる場合があります)")
+async def manual_scan(ctx, target_date: str = None):
+    """
+    手動でスキャンを実行（管理者のみ）
+    
+    Parameters:
+    -----------
+    target_date : str
+        YYYYMMDD形式の日付（デバッグモード用）
+    """
+    # 日付パラメータの解析
+    formatted_date = None
+    if target_date:
+        try:
+            # YYYYMMDD形式を解析
+            if len(target_date) == 8:
+                year = int(target_date[:4])
+                month = int(target_date[4:6])
+                day = int(target_date[6:8])
+                parsed_date = datetime(year, month, day)
+                
+                # 未来の日付は不可
+                if parsed_date > datetime.now():
+                    await ctx.send("❌ エラー: 未来の日付は指定できません。")
+                    return
+                
+                # 2年以上前の日付は不可
+                if parsed_date < datetime.now() - timedelta(days=730):
+                    await ctx.send("❌ エラー: 2年以上前の日付は指定できません。")
+                    return
+                
+                formatted_date = parsed_date.strftime('%Y-%m-%d')
+                await ctx.send(f"📡 デバッグモード: {formatted_date}時点のデータで手動スキャンを開始します...")
+            else:
+                await ctx.send("❌ エラー: 日付はYYYYMMDD形式で指定してください（例: 20250529）")
+                return
+        except ValueError:
+            await ctx.send("❌ エラー: 無効な日付形式です。YYYYMMDD形式で指定してください（例: 20250529）")
+            return
+    else:
+        await ctx.send("📡 手動スキャンを開始します... (時間がかかる場合があります)")
     
     # 修正3: スキャン前にキャッシュをクリア
     global data_cache
@@ -1316,20 +1526,23 @@ async def manual_scan(ctx):
     await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
     
     # デバッグモード有効化メッセージ
-    await ctx.send("📊 デバッグモードで実行中（NVDA、AAPL、MSFTの詳細情報を表示）")
+    if not target_date:
+        await ctx.send("📊 デバッグモードで実行中（NVDA、AAPL、MSFTの詳細情報を表示）")
     
     start_time = datetime.now()
-    alerts = await scan_all_symbols_optimized()
+    alerts = await scan_all_symbols_optimized(formatted_date)
     processing_time = (datetime.now() - start_time).total_seconds()
     
     # 除外された銘柄の情報（改善版）
     excluded_info = []
+    reference_date = pd.Timestamp(formatted_date) if formatted_date else datetime.now()
+    
     for symbol in ["NVDA", "AAPL", "MSFT"]:
         if symbol in signal_manager.signal_history:
             status = signal_manager.signal_history[symbol]
             last_signal = status.get('last_signal_date')
             if last_signal:
-                days_since = (datetime.now() - last_signal).days
+                days_since = (reference_date - last_signal).days
                 if days_since < signal_manager.cooling_period:
                     excluded_info.append(f"{symbol}: 冷却期間中（あと{signal_manager.cooling_period - days_since}日）")
                 else:
@@ -1337,13 +1550,14 @@ async def manual_scan(ctx):
                     excluded_info.append(f"{symbol}: {completed}個のセットアップ完了済み")
     
     scan_summary = f"スキャン完了: {processing_time:.1f}秒"
-    if excluded_info:
+    if excluded_info and not target_date:
         scan_summary += f"\n履歴情報: {', '.join(excluded_info)}"
     
     await ctx.send(scan_summary)
     
     if alerts:
-        await post_alerts(ctx.channel, alerts)
+        target_timestamp = pd.Timestamp(formatted_date) if formatted_date else None
+        await post_alerts(ctx.channel, alerts, target_timestamp)
     else:
         await ctx.send("シグナルは検出されませんでした。")
 
