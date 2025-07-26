@@ -354,19 +354,21 @@ class HWBAnalyzer:
         target_date : str
             対象日（'YYYY-MM-DD'形式）
         """
+        # 修正案1: キャッシュキーにtarget_dateを含める
+        cache_dict_key = f"{symbol}_{target_date}" if target_date else symbol
+        
         # キャッシュチェック
-        cache_key_with_date = f"{cache_key}_{target_date}" if target_date else cache_key
-        if symbol in data_cache:
-            cached_data, cache_time = data_cache[symbol]
+        if cache_dict_key in data_cache:
+            cached_data, cache_time = data_cache[cache_dict_key]
             if datetime.now() - cache_time < timedelta(hours=CACHE_EXPIRY_HOURS):
                 return cached_data
         
         # データ取得
         df_daily, df_weekly = HWBAnalyzer._fetch_stock_data(symbol, target_date)
         
-        # キャッシュに保存
+        # キャッシュに保存（修正されたキーを使用）
         if df_daily is not None and df_weekly is not None:
-            data_cache[symbol] = ((df_daily, df_weekly), datetime.now())
+            data_cache[cache_dict_key] = ((df_daily, df_weekly), datetime.now())
         
         return df_daily, df_weekly
     
