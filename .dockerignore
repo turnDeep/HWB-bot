@@ -12,6 +12,14 @@ ENV/
 env/
 .venv/
 
+# SQLite Database
+*.db
+*.sqlite
+*.sqlite3
+hwb_cache.db
+hwb_cache.db-journal
+hwb_cache.db-wal
+
 # IDE
 .vscode/
 .idea/
