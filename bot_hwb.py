@@ -659,6 +659,45 @@ class DatabaseManager:
             last_check = pd.Timestamp(result[0])
             return (datetime.now() - last_check).total_seconds() > hours * 3600
 
+    def needs_update(self, symbol: str, target_date: str = None) -> bool:
+        """
+        指定された銘柄のデータ更新が必要か判断する
+
+        Parameters:
+        -----------
+        symbol : str
+            銘柄コード
+        target_date : str
+            対象日（デバッグモード用）。指定されている場合は常にFalseを返す
+
+        Returns:
+        --------
+        bool
+            更新が必要な場合はTrue
+        """
+        # デバッグモードでは更新しない
+        if target_date:
+            return False
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT last_successful_fetch FROM metadata
+                WHERE symbol = ?
+            ''', (symbol,))
+            result = cursor.fetchone()
+
+            # メタデータがない場合は更新が必要
+            if not result or not result[0]:
+                return True
+
+            # 最終取得日時からの経過時間をチェック
+            last_fetch_time = pd.Timestamp(result[0])
+            if (datetime.now() - last_fetch_time).days >= CACHE_EXPIRY_DAYS:
+                return True
+
+        return False
+
 
 # グローバルなデータベースマネージャー
 db_manager = DatabaseManager(DB_PATH)
