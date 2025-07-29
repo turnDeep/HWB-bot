@@ -21,6 +21,9 @@ from functools import lru_cache
 import pickle
 from typing import List, Dict, Set, Tuple, Optional
 import aiohttp
+import sqlite3
+from bs4 import BeautifulSoup
+import re
 warnings.filterwarnings("ignore")
 
 # .envファイルから環境変数を読み込み
@@ -63,7 +66,11 @@ POST_STRATEGY2_ALERTS = parse_bool_env("POST_STRATEGY2_ALERTS", False)
 # 処理最適化パラメータ
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 20))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
-CACHE_EXPIRY_HOURS = int(os.getenv("CACHE_EXPIRY_HOURS", 24))  # 修正2: デフォルトを24時間に変更
+CACHE_EXPIRY_HOURS = int(os.getenv("CACHE_EXPIRY_HOURS", 24))
+
+# SQLiteデータベース設定
+DB_PATH = "hwb_cache.db"
+CACHE_EXPIRY_DAYS = 1  # データの有効期限（日数）
 
 # グローバル変数
 watched_symbols = set()
@@ -71,12 +78,590 @@ setup_alerts = {}
 fvg_alerts = {}
 breakout_alerts = {}
 server_configs = {}
-data_cache = {}
 recent_signals_history = {}  # 直近シグナル履歴を保存する新しい変数
 
 # タイムゾーン設定
 ET = pytz.timezone("US/Eastern")
 JST = pytz.timezone("Asia/Tokyo")
+
+
+class DatabaseManager:
+    """SQLiteデータベース管理クラス"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """データベースの初期化"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Russell 3000銘柄テーブル
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS russell3000_symbols (
+                    symbol TEXT PRIMARY KEY,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 日足データテーブル
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_data (
+                    symbol TEXT,
+                    date DATE,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume INTEGER,
+                    sma200 REAL,
+                    ema200 REAL,
+                    PRIMARY KEY (symbol, date)
+                )
+            ''')
+            
+            # 週足データテーブル
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS weekly_data (
+                    symbol TEXT,
+                    date DATE,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume INTEGER,
+                    sma200 REAL,
+                    PRIMARY KEY (symbol, date)
+                )
+            ''')
+            
+            # ルール②: セットアップテーブル
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS rule2_setups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    setup_date DATE NOT NULL,
+                    open REAL,
+                    close REAL,
+                    high REAL,
+                    low REAL,
+                    sma200 REAL,
+                    ema200 REAL,
+                    zone_upper REAL,
+                    zone_lower REAL,
+                    detected_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1,
+                    UNIQUE(symbol, setup_date)
+                )
+            ''')
+            
+            # ルール③: FVGテーブル
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS rule3_fvgs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    setup_id INTEGER,
+                    start_date DATE,
+                    end_date DATE,
+                    formation_date DATE NOT NULL,
+                    upper_bound REAL,
+                    lower_bound REAL,
+                    gap_size REAL,
+                    gap_percentage REAL,
+                    third_candle_open REAL,
+                    third_candle_close REAL,
+                    detected_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_broken BOOLEAN DEFAULT 0,
+                    FOREIGN KEY (setup_id) REFERENCES rule2_setups(id),
+                    UNIQUE(symbol, setup_id, formation_date)
+                )
+            ''')
+            
+            # ルール④: ブレイクアウトシグナルテーブル
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS rule4_breakouts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    setup_id INTEGER,
+                    fvg_id INTEGER,
+                    breakout_date DATE NOT NULL,
+                    breakout_price REAL,
+                    resistance_price REAL,
+                    breakout_percentage REAL,
+                    detected_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    signal_posted BOOLEAN DEFAULT 0,
+                    FOREIGN KEY (setup_id) REFERENCES rule2_setups(id),
+                    FOREIGN KEY (fvg_id) REFERENCES rule3_fvgs(id),
+                    UNIQUE(symbol, setup_id, fvg_id, breakout_date)
+                )
+            ''')
+            
+            # メタデータテーブル（最終更新日時など）
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS metadata (
+                    symbol TEXT PRIMARY KEY,
+                    last_daily_update TIMESTAMP,
+                    last_weekly_update TIMESTAMP,
+                    last_successful_fetch TIMESTAMP,
+                    last_rule_check TIMESTAMP
+                )
+            ''')
+            
+            # インデックスの作成
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_symbol_date ON daily_data(symbol, date DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_weekly_symbol_date ON weekly_data(symbol, date DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_setups_symbol_date ON rule2_setups(symbol, setup_date DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_fvgs_symbol_date ON rule3_fvgs(symbol, formation_date DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_breakouts_symbol_date ON rule4_breakouts(symbol, breakout_date DESC)')
+            
+            conn.commit()
+    
+    def get_russell3000_symbols(self) -> Set[str]:
+        """Russell 3000銘柄リストを取得（DBキャッシュ付き）"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # 最終更新から1週間以内のデータがあるかチェック
+            cursor.execute('''
+                SELECT symbol FROM russell3000_symbols 
+                WHERE last_updated > datetime('now', '-7 days')
+            ''')
+            
+            cached_symbols = {row[0] for row in cursor.fetchall()}
+            
+            if cached_symbols:
+                print(f"Russell 3000銘柄をDBから取得: {len(cached_symbols)}銘柄")
+                return cached_symbols
+            
+            # キャッシュがない場合は新規取得
+            print("Russell 3000銘柄を新規取得中...")
+            symbols = self._fetch_russell3000_symbols()
+            
+            if symbols:
+                # DBに保存
+                cursor.execute('DELETE FROM russell3000_symbols')
+                cursor.executemany(
+                    'INSERT INTO russell3000_symbols (symbol) VALUES (?)',
+                    [(s,) for s in symbols]
+                )
+                conn.commit()
+                print(f"Russell 3000銘柄をDBに保存: {len(symbols)}銘柄")
+            
+            return symbols
+    
+    def _fetch_russell3000_symbols(self) -> Set[str]:
+        """Russell 3000銘柄を外部から取得"""
+        symbols = set()
+        
+        try:
+            # オプション1: iShares Russell 3000 ETF (IWV) の構成銘柄を取得
+            # BlackRockのAPIを使用（公開されている場合）
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            # iSharesのホールディングスCSVを取得
+            iwv_url = "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf/1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
+            
+            try:
+                response = requests.get(iwv_url, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    # CSVデータをパース
+                    lines = response.text.strip().split('\n')
+                    for line in lines[10:]:  # ヘッダー行をスキップ
+                        if line and ',' in line:
+                            parts = line.split(',')
+                            if len(parts) > 0:
+                                ticker = parts[0].strip().strip('"')
+                                if ticker and len(ticker) <= 5 and ticker.isalpha():
+                                    symbols.add(ticker)
+                    
+                    if len(symbols) > 2000:  # 妥当性チェック
+                        print(f"iShares IWVから{len(symbols)}銘柄を取得")
+                        return symbols
+            except Exception as e:
+                print(f"iSharesからの取得エラー: {e}")
+            
+            # オプション2: フォールバックとしてS&P500 + 追加の主要銘柄を使用
+            print("フォールバック: S&P500 + 主要銘柄を使用")
+            
+            # S&P500
+            sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+            sp500_symbols = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
+            symbols.update(sp500_symbols)
+            
+            # Russell 2000の主要銘柄も追加（より多くの中小型株をカバー）
+            russell2000_url = "https://en.wikipedia.org/wiki/Russell_2000_Index"
+            try:
+                tables = pd.read_html(russell2000_url)
+                for table in tables:
+                    if 'Symbol' in table.columns or 'Ticker' in table.columns:
+                        col_name = 'Symbol' if 'Symbol' in table.columns else 'Ticker'
+                        additional_symbols = table[col_name].str.replace(".", "-", regex=False).tolist()
+                        symbols.update(additional_symbols)
+            except:
+                pass
+            
+            # 主要な中型株・小型株を追加
+            additional_stocks = [
+                # 中型株の例
+                "SNOW", "PLTR", "DDOG", "ZM", "DOCU", "OKTA", "TWLO", "ROKU",
+                "PINS", "SNAP", "HOOD", "SOFI", "AFRM", "UPST", "RBLX", "COIN",
+                # 小型株の例
+                "CLOV", "WISH", "SPCE", "NKLA", "RIDE", "GOEV", "LCID", "RIVN",
+                # その他の主要銘柄
+                "GME", "AMC", "BB", "NOK", "BBBY", "TLRY", "ACB", "CGC"
+            ]
+            symbols.update(additional_stocks)
+            
+            # 重複を除去してソート
+            symbols = {s.upper() for s in symbols if s and len(s) <= 5}
+            
+            print(f"合計: {len(symbols)}銘柄を取得")
+            return symbols
+            
+        except Exception as e:
+            print(f"Russell 3000銘柄取得エラー: {e}")
+            # 最小限のリストを返す
+            return set(["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"])
+    
+    def get_cached_stock_data(self, symbol: str, target_date: str = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """キャッシュされた株価データを取得"""
+        with sqlite3.connect(self.db_path) as conn:
+            # 対象日を設定
+            if target_date:
+                end_date = pd.Timestamp(target_date)
+            else:
+                end_date = pd.Timestamp.now()
+            
+            # データが必要な期間を計算
+            daily_start = end_date - pd.Timedelta(days=730)  # 2年前
+            weekly_start = end_date - pd.Timedelta(days=1825)  # 5年前
+            
+            # 日足データを取得
+            df_daily = pd.read_sql_query(
+                '''SELECT date, open, high, low, close, volume, sma200, ema200
+                   FROM daily_data
+                   WHERE symbol = ? AND date >= ? AND date <= ?
+                   ORDER BY date''',
+                conn,
+                params=(symbol, daily_start.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')),
+                parse_dates=['date'],
+                index_col='date'
+            )
+            
+            # 週足データを取得
+            df_weekly = pd.read_sql_query(
+                '''SELECT date, open, high, low, close, volume, sma200
+                   FROM weekly_data
+                   WHERE symbol = ? AND date >= ? AND date <= ?
+                   ORDER BY date''',
+                conn,
+                params=(symbol, weekly_start.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')),
+                parse_dates=['date'],
+                index_col='date'
+            )
+            
+            # カラム名を大文字に変換（yfinanceとの互換性）
+            if not df_daily.empty:
+                df_daily.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA200', 'EMA200']
+            if not df_weekly.empty:
+                df_weekly.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA200']
+            
+            return df_daily if not df_daily.empty else None, df_weekly if not df_weekly.empty else None
+    
+    def save_stock_data(self, symbol: str, df_daily: pd.DataFrame, df_weekly: pd.DataFrame):
+        """株価データをDBに保存"""
+        with sqlite3.connect(self.db_path) as conn:
+            # 日足データを保存
+            daily_records = []
+            for idx, row in df_daily.iterrows():
+                daily_records.append((
+                    symbol,
+                    idx.strftime('%Y-%m-%d'),
+                    row.get('Open'),
+                    row.get('High'),
+                    row.get('Low'),
+                    row.get('Close'),
+                    row.get('Volume'),
+                    row.get('SMA200'),
+                    row.get('EMA200')
+                ))
+            
+            # REPLACE INTOを使用して既存データを更新
+            conn.executemany('''
+                REPLACE INTO daily_data 
+                (symbol, date, open, high, low, close, volume, sma200, ema200)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', daily_records)
+            
+            # 週足データを保存
+            weekly_records = []
+            for idx, row in df_weekly.iterrows():
+                weekly_records.append((
+                    symbol,
+                    idx.strftime('%Y-%m-%d'),
+                    row.get('Open'),
+                    row.get('High'),
+                    row.get('Low'),
+                    row.get('Close'),
+                    row.get('Volume'),
+                    row.get('SMA200')
+                ))
+            
+            conn.executemany('''
+                REPLACE INTO weekly_data 
+                (symbol, date, open, high, low, close, volume, sma200)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', weekly_records)
+            
+            # メタデータを更新
+            conn.execute('''
+                REPLACE INTO metadata (symbol, last_daily_update, last_weekly_update, last_successful_fetch)
+                VALUES (?, ?, ?, ?)
+            ''', (symbol, datetime.now(), datetime.now(), datetime.now()))
+            
+            conn.commit()
+    
+    def save_setup(self, symbol: str, setup: Dict) -> int:
+        """ルール②のセットアップを保存"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO rule2_setups 
+                    (symbol, setup_date, open, close, high, low, sma200, ema200, zone_upper, zone_lower)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    symbol,
+                    setup['date'].strftime('%Y-%m-%d'),
+                    setup['open'],
+                    setup['close'],
+                    setup['high'],
+                    setup['low'],
+                    setup['sma200'],
+                    setup['ema200'],
+                    setup['zone_upper'],
+                    setup['zone_lower']
+                ))
+                conn.commit()
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                # 既存のレコードがある場合はIDを取得
+                cursor.execute('''
+                    SELECT id FROM rule2_setups 
+                    WHERE symbol = ? AND setup_date = ?
+                ''', (symbol, setup['date'].strftime('%Y-%m-%d')))
+                return cursor.fetchone()[0]
+    
+    def save_fvg(self, symbol: str, setup_id: int, fvg: Dict) -> int:
+        """ルール③のFVGを保存"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO rule3_fvgs 
+                    (symbol, setup_id, start_date, end_date, formation_date, 
+                     upper_bound, lower_bound, gap_size, gap_percentage,
+                     third_candle_open, third_candle_close)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    symbol,
+                    setup_id,
+                    fvg['start_date'].strftime('%Y-%m-%d'),
+                    fvg['end_date'].strftime('%Y-%m-%d'),
+                    fvg['formation_date'].strftime('%Y-%m-%d'),
+                    fvg['upper_bound'],
+                    fvg['lower_bound'],
+                    fvg['gap_size'],
+                    fvg['gap_percentage'],
+                    fvg['third_candle_open'],
+                    fvg['third_candle_close']
+                ))
+                conn.commit()
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                # 既存のレコードがある場合はIDを取得
+                cursor.execute('''
+                    SELECT id FROM rule3_fvgs 
+                    WHERE symbol = ? AND setup_id = ? AND formation_date = ?
+                ''', (symbol, setup_id, fvg['formation_date'].strftime('%Y-%m-%d')))
+                return cursor.fetchone()[0]
+    
+    def save_breakout(self, symbol: str, setup_id: int, fvg_id: int, breakout: Dict) -> int:
+        """ルール④のブレイクアウトを保存"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO rule4_breakouts 
+                    (symbol, setup_id, fvg_id, breakout_date, breakout_price,
+                     resistance_price, breakout_percentage)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    symbol,
+                    setup_id,
+                    fvg_id,
+                    breakout['breakout_date'].strftime('%Y-%m-%d'),
+                    breakout['breakout_price'],
+                    breakout['resistance_price'],
+                    breakout['breakout_percentage']
+                ))
+                conn.commit()
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                return None
+    
+    def get_cached_setups(self, symbol: str, lookback_days: int = 60) -> List[Dict]:
+        """キャッシュされたセットアップを取得"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cutoff_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+            
+            cursor.execute('''
+                SELECT id, setup_date, open, close, high, low, 
+                       sma200, ema200, zone_upper, zone_lower
+                FROM rule2_setups
+                WHERE symbol = ? AND setup_date >= ? AND is_active = 1
+                ORDER BY setup_date DESC
+            ''', (symbol, cutoff_date))
+            
+            setups = []
+            for row in cursor.fetchall():
+                setups.append({
+                    'id': row[0],
+                    'date': pd.Timestamp(row[1]),
+                    'open': row[2],
+                    'close': row[3],
+                    'high': row[4],
+                    'low': row[5],
+                    'sma200': row[6],
+                    'ema200': row[7],
+                    'zone_upper': row[8],
+                    'zone_lower': row[9]
+                })
+            
+            return setups
+    
+    def get_cached_fvgs(self, symbol: str, setup_id: int) -> List[Dict]:
+        """キャッシュされたFVGを取得"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, start_date, end_date, formation_date,
+                       upper_bound, lower_bound, gap_size, gap_percentage,
+                       third_candle_open, third_candle_close
+                FROM rule3_fvgs
+                WHERE symbol = ? AND setup_id = ? AND is_broken = 0
+                ORDER BY formation_date
+            ''', (symbol, setup_id))
+            
+            fvgs = []
+            for row in cursor.fetchall():
+                fvgs.append({
+                    'id': row[0],
+                    'start_date': pd.Timestamp(row[1]),
+                    'end_date': pd.Timestamp(row[2]),
+                    'formation_date': pd.Timestamp(row[3]),
+                    'upper_bound': row[4],
+                    'lower_bound': row[5],
+                    'gap_size': row[6],
+                    'gap_percentage': row[7],
+                    'third_candle_open': row[8],
+                    'third_candle_close': row[9]
+                })
+            
+            return fvgs
+    
+    def get_cached_breakouts(self, symbol: str, date: str = None) -> List[Dict]:
+        """キャッシュされたブレイクアウトを取得"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            if date:
+                cursor.execute('''
+                    SELECT b.*, s.setup_date, f.formation_date
+                    FROM rule4_breakouts b
+                    JOIN rule2_setups s ON b.setup_id = s.id
+                    JOIN rule3_fvgs f ON b.fvg_id = f.id
+                    WHERE b.symbol = ? AND b.breakout_date = ?
+                ''', (symbol, date))
+            else:
+                cursor.execute('''
+                    SELECT b.*, s.setup_date, f.formation_date
+                    FROM rule4_breakouts b
+                    JOIN rule2_setups s ON b.setup_id = s.id
+                    JOIN rule3_fvgs f ON b.fvg_id = f.id
+                    WHERE b.symbol = ?
+                    ORDER BY b.breakout_date DESC
+                    LIMIT 10
+                ''', (symbol,))
+            
+            breakouts = []
+            for row in cursor.fetchall():
+                breakouts.append({
+                    'id': row[0],
+                    'breakout_date': pd.Timestamp(row[4]),
+                    'breakout_price': row[5],
+                    'resistance_price': row[6],
+                    'breakout_percentage': row[7],
+                    'setup_date': pd.Timestamp(row[10]),
+                    'fvg_formation_date': pd.Timestamp(row[11])
+                })
+            
+            return breakouts
+    
+    def mark_fvg_broken(self, fvg_id: int):
+        """FVGを破られた状態にマーク"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE rule3_fvgs SET is_broken = 1 WHERE id = ?
+            ''', (fvg_id,))
+            conn.commit()
+    
+    def update_last_rule_check(self, symbol: str):
+        """最終ルールチェック日時を更新"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE metadata 
+                SET last_rule_check = CURRENT_TIMESTAMP 
+                WHERE symbol = ?
+            ''', (symbol,))
+            
+            if cursor.rowcount == 0:
+                cursor.execute('''
+                    INSERT INTO metadata (symbol, last_rule_check)
+                    VALUES (?, CURRENT_TIMESTAMP)
+                ''', (symbol,))
+            
+            conn.commit()
+    
+    def should_check_rules(self, symbol: str, hours: int = 24) -> bool:
+        """ルールチェックが必要かどうか判定"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT last_rule_check FROM metadata WHERE symbol = ?
+            ''', (symbol,))
+            
+            result = cursor.fetchone()
+            if not result or not result[0]:
+                return True
+            
+            last_check = pd.Timestamp(result[0])
+            return (datetime.now() - last_check).total_seconds() > hours * 3600
+
+
+# グローバルなデータベースマネージャー
+db_manager = DatabaseManager(DB_PATH)
 
 
 class ImprovedSignalManager:
@@ -219,74 +804,6 @@ class ImprovedSignalManager:
 signal_manager = ImprovedSignalManager(cooling_period=SIGNAL_COOLING_PERIOD)
 
 
-def get_nasdaq_nyse_symbols() -> Set[str]:
-    """NASDAQ/NYSEの全銘柄リストを取得（重複除去）"""
-    symbols = set()
-    
-    try:
-        # NASDAQ銘柄を取得
-        nasdaq_url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&exchange=NASDAQ&download=true"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        print("NASDAQ銘柄リストを取得中...")
-        try:
-            response = requests.get(nasdaq_url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                nasdaq_stocks = data.get('data', {}).get('rows', [])
-                nasdaq_symbols = {stock['symbol'] for stock in nasdaq_stocks if stock.get('symbol')}
-                symbols.update(nasdaq_symbols)
-                print(f"NASDAQ: {len(nasdaq_symbols)}銘柄")
-        except Exception as e:
-            print(f"NASDAQ取得エラー: {e}")
-            # フォールバック: yfinanceから主要銘柄を取得
-            nasdaq_tickers = yf.Tickers("AAPL MSFT GOOGL AMZN NVDA META TSLA")
-            symbols.update(nasdaq_tickers.symbols)
-        
-        # NYSE銘柄を取得
-        print("NYSE銘柄リストを取得中...")
-        try:
-            # NYSE銘柄はfinvizから取得を試みる
-            nyse_url = "https://finviz.com/screener.ashx?v=111&f=exch_nyse"
-            response = requests.get(nyse_url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                # HTMLパースして銘柄を抽出（簡易的な方法）
-                # より確実な方法はSeleniumやAPIを使用
-                pass
-        except Exception as e:
-            print(f"NYSE取得エラー: {e}")
-        
-        # 代替方法: S&P500 + 追加の主要銘柄
-        if len(symbols) < 100:  # 取得失敗時のフォールバック
-            print("フォールバック: S&P500 + 主要銘柄を使用")
-            # S&P500
-            sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-            sp500_symbols = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
-            symbols.update(sp500_symbols)
-            
-            # 追加の主要銘柄
-            major_stocks = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
-                "JPM", "JNJ", "V", "PG", "UNH", "HD", "MA", "DIS", "BAC", "XOM",
-                "NFLX", "ADBE", "CRM", "PFE", "TMO", "ABBV", "KO", "PEP", "AVGO",
-                "CSCO", "ACN", "COST", "WMT", "MRK", "CVX", "LLY", "ORCL", "DHR"
-            ]
-            symbols.update(major_stocks)
-        
-        # 重複を除去してソート
-        symbols = {s.upper() for s in symbols if s and len(s) <= 5}  # 通常のティッカーは5文字以下
-        print(f"合計: {len(symbols)}銘柄（重複除去後）")
-        
-        return symbols
-        
-    except Exception as e:
-        print(f"銘柄リスト取得エラー: {e}")
-        # 最小限のリストを返す
-        return set(["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"])
-
-
 def get_business_days_ago(days: int, reference_date: pd.Timestamp = None) -> pd.Timestamp:
     """
     指定された営業日前の日付を取得
@@ -341,34 +858,60 @@ def update_recent_signals_history(alerts: List[Dict], target_date: pd.Timestamp 
 
 
 class HWBAnalyzer:
-    """HWB戦略の分析クラス（最適化版）"""
+    """HWB戦略の分析クラス（SQLite対応版）"""
     
     @staticmethod
-    @lru_cache(maxsize=1000)
-    def get_cached_stock_data(symbol: str, cache_key: str, target_date: str = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    def get_cached_stock_data(symbol: str, target_date: str = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """
-        キャッシュ付き株価データ取得
+        SQLiteキャッシュを使用した株価データ取得
         
         Parameters:
         -----------
         target_date : str
             対象日（'YYYY-MM-DD'形式）
         """
-        # 修正案1: キャッシュキーにtarget_dateを含める
-        cache_dict_key = f"{symbol}_{target_date}" if target_date else symbol
+        # まずDBから取得を試みる
+        df_daily, df_weekly = db_manager.get_cached_stock_data(symbol, target_date)
         
-        # キャッシュチェック
-        if cache_dict_key in data_cache:
-            cached_data, cache_time = data_cache[cache_dict_key]
-            if datetime.now() - cache_time < timedelta(hours=CACHE_EXPIRY_HOURS):
-                return cached_data
+        # データが十分かチェック
+        needs_fetch = False
+        if df_daily is None or len(df_daily) < 200:
+            needs_fetch = True
+        if df_weekly is None or len(df_weekly) < 200:
+            needs_fetch = True
         
-        # データ取得
-        df_daily, df_weekly = HWBAnalyzer._fetch_stock_data(symbol, target_date)
+        # デバッグモードでなく、更新が必要な場合のみ新規取得
+        if needs_fetch and not target_date and db_manager.needs_update(symbol, target_date):
+            # yfinanceから新規取得
+            df_daily_new, df_weekly_new = HWBAnalyzer._fetch_stock_data(symbol, target_date)
+            
+            if df_daily_new is not None and df_weekly_new is not None:
+                # 移動平均を計算
+                df_daily_new, df_weekly_new = HWBAnalyzer.prepare_data(df_daily_new, df_weekly_new)
+                
+                # DBに保存
+                db_manager.save_stock_data(symbol, df_daily_new, df_weekly_new)
+                
+                return df_daily_new, df_weekly_new
         
-        # キャッシュに保存（修正されたキーを使用）
+        # DBのデータをそのまま使用（移動平均は計算済み）
         if df_daily is not None and df_weekly is not None:
-            data_cache[cache_dict_key] = ((df_daily, df_weekly), datetime.now())
+            # 週足情報を日足に結合
+            df_daily['Weekly_SMA200'] = np.nan
+            df_daily['Weekly_Close'] = np.nan
+            
+            for idx, row in df_weekly.iterrows():
+                if pd.notna(row.get('SMA200')):
+                    week_start = idx - pd.Timedelta(days=idx.weekday())
+                    week_end = week_start + pd.Timedelta(days=4)
+                    
+                    mask = (df_daily.index >= week_start) & (df_daily.index <= week_end)
+                    if mask.any():
+                        df_daily.loc[mask, 'Weekly_SMA200'] = row['SMA200']
+                        df_daily.loc[mask, 'Weekly_Close'] = row['Close']
+            
+            df_daily['Weekly_SMA200'] = df_daily['Weekly_SMA200'].ffill()
+            df_daily['Weekly_Close'] = df_daily['Weekly_Close'].ffill()
         
         return df_daily, df_weekly
     
@@ -461,13 +1004,10 @@ class HWBAnalyzer:
             対象日（'YYYY-MM-DD'形式）
         """
         try:
-            cache_key = target_date if target_date else datetime.now().strftime("%Y%m%d")
-            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key, target_date)
+            df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, target_date)
             
             if df_daily is None or df_weekly is None:
                 return symbol, False
-            
-            df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
             
             # ルール①チェック（改善版）
             if 'Weekly_SMA200' not in df_daily.columns or 'Weekly_Close' not in df_daily.columns:
@@ -572,23 +1112,52 @@ class HWBAnalyzer:
     @staticmethod
     def _check_remaining_rules_sync(symbol: str, target_date: str = None) -> List[Dict]:
         """
-        ルール②③④の同期版チェック（改善版）
+        ルール②③④の同期版チェック（DB対応版）
         
         Parameters:
         -----------
         target_date : str
             対象日（'YYYY-MM-DD'形式）
         """
-        cache_key = target_date if target_date else datetime.now().strftime("%Y%m%d")
-        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key, target_date)
+        # DBから最新データを確認（通常モードのみ）
+        if not target_date and not db_manager.should_check_rules(symbol, hours=12):
+            # 12時間以内にチェック済みの場合は、DBから結果を取得
+            cached_breakouts = db_manager.get_cached_breakouts(symbol, datetime.now().strftime('%Y-%m-%d'))
+            if cached_breakouts:
+                # キャッシュから結果を構築
+                results = []
+                for breakout in cached_breakouts:
+                    results.append({
+                        'symbol': symbol,
+                        'signal_type': 's2_breakout',
+                        'breakout': breakout,
+                        'cached': True
+                    })
+                return results
+        
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, target_date)
         
         if df_daily is None or df_weekly is None:
             return []
         
-        df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
+        # ルール②セットアップを探す（DBキャッシュも確認）
+        cached_setups = db_manager.get_cached_setups(symbol, lookback_days=SETUP_LOOKBACK_DAYS)
+        new_setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
         
-        # ルール②セットアップを探す
-        setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
+        # 新しいセットアップをDBに保存
+        setup_id_map = {}
+        for setup in new_setups:
+            setup_id = db_manager.save_setup(symbol, setup)
+            setup_id_map[setup['date']] = setup_id
+            setup['id'] = setup_id
+        
+        # キャッシュと新規を統合（重複除去）
+        all_setups = {}
+        for setup in cached_setups + new_setups:
+            all_setups[setup['date']] = setup
+        
+        setups = list(all_setups.values())
+        
         if not setups:
             return []
         
@@ -600,6 +1169,7 @@ class HWBAnalyzer:
         # 各セットアップに対してシグナルマネージャーでチェック
         for setup in setups:
             setup_date = setup['date']
+            setup_id = setup.get('id')
             
             # このセットアップを処理すべきかチェック
             if not signal_manager.should_process_setup(symbol, setup_date, reference_date):
@@ -609,10 +1179,28 @@ class HWBAnalyzer:
                     print(f"{symbol}: セットアップ {setup_date.strftime('%Y-%m-%d')} は除外 - {reason}")
                 continue
             
-            # ルール③FVG検出
-            fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup_date)
+            # ルール③FVG検出（DBキャッシュも確認）
+            cached_fvgs = db_manager.get_cached_fvgs(symbol, setup_id) if setup_id else []
+            new_fvgs = HWBAnalyzer.detect_fvg_after_setup(df_daily, setup_date)
+            
+            # 新しいFVGをDBに保存
+            fvg_id_map = {}
+            for fvg in new_fvgs:
+                if setup_id:
+                    fvg_id = db_manager.save_fvg(symbol, setup_id, fvg)
+                    fvg_id_map[fvg['formation_date']] = fvg_id
+                    fvg['id'] = fvg_id
+            
+            # キャッシュと新規を統合
+            all_fvgs = {}
+            for fvg in cached_fvgs + new_fvgs:
+                all_fvgs[fvg['formation_date']] = fvg
+            
+            fvgs = list(all_fvgs.values())
             
             for fvg in fvgs:
+                fvg_id = fvg.get('id')
+                
                 # ルール④ブレイクアウトチェック（指定日のみ）
                 breakout = HWBAnalyzer.check_breakout(df_daily, setup, fvg, today_only=True, target_date=target_date)
                 
@@ -632,10 +1220,26 @@ class HWBAnalyzer:
                         result['signal_type'] = 's2_breakout'
                         result['breakout'] = breakout
                         
+                        # ブレイクアウトをDBに保存
+                        if setup_id and fvg_id and not target_date:  # 通常モードのみ保存
+                            db_manager.save_breakout(symbol, setup_id, fvg_id, breakout)
+                        
                         # シグナル履歴を更新（ブレイクアウト時のみ記録）
                         signal_manager.record_signal(symbol, setup_date, reference_date)
                     
                     results.append(result)
+                
+                # FVGが破られたかチェック
+                if fvg_id and not breakout:
+                    post_fvg_data = df_daily[df_daily.index > fvg['formation_date']]
+                    if len(post_fvg_data) > 0:
+                        min_low = post_fvg_data['Low'].min()
+                        if min_low < fvg['lower_bound']:
+                            db_manager.mark_fvg_broken(fvg_id)
+        
+        # 最終チェック日時を更新
+        if not target_date:  # 通常モードのみ
+            db_manager.update_last_rule_check(symbol)
         
         return results
     
@@ -816,13 +1420,10 @@ class HWBAnalyzer:
         target_date : str
             対象日（'YYYY-MM-DD'形式）。デバッグモード用
         """
-        cache_key = target_date if target_date else datetime.now().strftime("%Y%m%d")
-        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key, target_date)
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, target_date)
         
         if df_daily is None:
             return None
-        
-        df_daily, _ = HWBAnalyzer.prepare_data(df_daily, df_weekly)
         
         # デバッグモード時は指定日までのデータを使用
         if target_date:
@@ -946,7 +1547,7 @@ async def setup_guild(guild):
         try:
             alert_channel = await guild.create_text_channel(
                 name=BOT_CHANNEL_NAME,
-                topic="📈 HWB Strategy Alerts - NASDAQ/NYSE Technical Analysis Signals"
+                topic="📈 HWB Strategy Alerts - Russell 3000 Technical Analysis Signals"
             )
         except discord.Forbidden:
             print(f"チャンネル作成権限がありません: {guild.name}")
@@ -1091,7 +1692,7 @@ def create_summary_embed(alerts: List[Dict], target_date: pd.Timestamp = None) -
         scan_time = datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')
         description = ""
     
-    description += f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {scan_time}"
+    description += f"**Russell 3000 スキャン結果**\nスキャン時刻: {scan_time}"
     
     embed = discord.Embed(
         title=title,
@@ -1209,7 +1810,7 @@ async def post_alerts(channel, alerts: List[Dict], target_date: pd.Timestamp = N
             # シグナルがない場合のサマリー
             no_signal_embed = discord.Embed(
                 title="AI判定システム" + ("（デバッグモード）" if target_date else ""),
-                description=f"**NASDAQ/NYSE スキャン結果**\nスキャン時刻: {target_date.strftime('%Y-%m-%d') if target_date else datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
+                description=f"**Russell 3000 スキャン結果**\nスキャン時刻: {target_date.strftime('%Y-%m-%d') if target_date else datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}",
                 color=discord.Color.grey(),
                 timestamp=datetime.now()
             )
@@ -1319,7 +1920,7 @@ async def post_alerts(channel, alerts: List[Dict], target_date: pd.Timestamp = N
 @bot.event
 async def on_ready():
     global watched_symbols
-    watched_symbols = get_nasdaq_nyse_symbols()
+    watched_symbols = db_manager.get_russell3000_symbols()
     print(f"{bot.user} がログインしました！")
     print(f"監視銘柄数: {len(watched_symbols):,}")
     
@@ -1330,8 +1931,9 @@ async def on_ready():
     print(f"  戦略2アラート: {'ON' if POST_STRATEGY2_ALERTS else 'OFF'}（当日シグナルは常に投稿）")
     print(f"  シグナル冷却期間: {signal_manager.cooling_period}日")
     
-    # キャッシュディレクトリを作成
-    os.makedirs("cache", exist_ok=True)
+    # SQLiteデータベース情報を表示
+    print(f"\nデータベース: {DB_PATH}")
+    print(f"  キャッシュ有効期限: {CACHE_EXPIRY_DAYS}日")
     
     for guild in bot.guilds:
         await setup_guild(guild)
@@ -1368,13 +1970,6 @@ async def daily_scan():
         daily_scan.last_scan_date = today_key
         
         print(f"日次スキャン開始: {now_et}")
-        
-        # 修正3: スキャン前にキャッシュをクリア
-        global data_cache
-        cache_size = len(data_cache)
-        data_cache.clear()
-        HWBAnalyzer.get_cached_stock_data.cache_clear()  # LRUキャッシュもクリア
-        print(f"キャッシュをクリアしました（{cache_size}件）")
         
         # 処理時間を計測
         start_time = datetime.now()
@@ -1438,7 +2033,7 @@ async def bot_status(ctx):
     
     embed.add_field(
         name="監視対象",
-        value=f"NASDAQ/NYSE\n{len(watched_symbols):,} 銘柄",
+        value=f"Russell 3000\n{len(watched_symbols):,} 銘柄",
         inline=True
     )
     
@@ -1455,11 +2050,18 @@ async def bot_status(ctx):
         inline=True
     )
     
-    # キャッシュ統計
-    cache_size = len(data_cache)
+    # データベース統計
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(DISTINCT symbol) FROM daily_data")
+        cached_symbols = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM daily_data")
+        total_records = cursor.fetchone()[0]
+    
     embed.add_field(
-        name="キャッシュ",
-        value=f"{cache_size} 銘柄\n有効期限: {CACHE_EXPIRY_HOURS}時間",
+        name="データベース",
+        value=f"{cached_symbols} 銘柄\n{total_records:,} レコード\n有効期限: {CACHE_EXPIRY_DAYS}日",
         inline=True
     )
     
@@ -1520,13 +2122,6 @@ async def manual_scan(ctx, target_date: str = None):
     else:
         await ctx.send("📡 手動スキャンを開始します... (時間がかかる場合があります)")
     
-    # 修正3: スキャン前にキャッシュをクリア
-    global data_cache
-    cache_size = len(data_cache)
-    data_cache.clear()
-    HWBAnalyzer.get_cached_stock_data.cache_clear()  # LRUキャッシュもクリア
-    await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
-    
     # デバッグモード有効化メッセージ
     if not target_date:
         await ctx.send("📊 デバッグモードで実行中（NVDA、AAPL、MSFTの詳細情報を表示）")
@@ -1566,7 +2161,7 @@ async def manual_scan(ctx, target_date: str = None):
 
 @bot.command(name="check")
 async def check_symbol(ctx, symbol: str):
-    """特定の銘柄をチェック（改善版）"""
+    """特定の銘柄をチェック（DB履歴対応版）"""
     symbol = symbol.upper()
     await ctx.send(f"🔍 {symbol} をチェック中...")
     
@@ -1599,20 +2194,27 @@ async def check_symbol(ctx, symbol: str):
                 else:
                     history_info += f"- 状態: ✅ 新規シグナル可能"
         
+        # DB履歴情報を追加
+        db_history_info = ""
+        cached_breakouts = db_manager.get_cached_breakouts(symbol)
+        if cached_breakouts:
+            db_history_info = f"\n\n📈 DB履歴（最近のブレイクアウト）:\n"
+            for i, breakout in enumerate(cached_breakouts[:5]):
+                db_history_info += f"- {breakout['breakout_date'].strftime('%Y-%m-%d')}: "
+                db_history_info += f"+{breakout['breakout_percentage']:.1f}% "
+                db_history_info += f"(Setup: {breakout['setup_date'].strftime('%m/%d')})\n"
+        
         # ルール②③④をチェック（個別チェックでは履歴を無視）
-        cache_key = datetime.now().strftime("%Y%m%d")
-        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol, cache_key)
+        df_daily, df_weekly = HWBAnalyzer.get_cached_stock_data(symbol)
         
         if df_daily is None or df_weekly is None:
             await ctx.send(f"エラー: {symbol} のデータ取得に失敗しました。")
             return
         
-        df_daily, df_weekly = HWBAnalyzer.prepare_data(df_daily, df_weekly)
-        
         # セットアップを検出（履歴チェックなし）
         setups = HWBAnalyzer.find_rule2_setups(df_daily, lookback_days=SETUP_LOOKBACK_DAYS)
         if not setups:
-            await ctx.send(f"該当なし - {symbol} は現在セットアップ条件（ルール②）を満たしていません。{history_info}")
+            await ctx.send(f"該当なし - {symbol} は現在セットアップ条件（ルール②）を満たしていません。{history_info}{db_history_info}")
             return
         
         # 各セットアップに対してFVGとブレイクアウトをチェック
@@ -1681,7 +2283,7 @@ async def check_symbol(ctx, symbol: str):
             if current_signal_active:
                 status_msg += "（シグナル発生済み）"
             
-            await ctx.send(f"{status_msg}{history_info}")
+            await ctx.send(f"{status_msg}{history_info}{db_history_info}")
             
             # 戦略2のEmbed表示（過去のブレイクアウトでもマーカーを表示）
             embed = create_simple_s2_embed(symbol, current_s2_signals)
@@ -1700,7 +2302,7 @@ async def check_symbol(ctx, symbol: str):
         elif current_s1_signals:
             # FVG条件のみ満たしている
             status_msg = "✅ 現在FVG条件を満たしています（ブレイクアウト待ち）"
-            await ctx.send(f"{status_msg}{history_info}")
+            await ctx.send(f"{status_msg}{history_info}{db_history_info}")
             
             # 戦略1のEmbed表示
             embed = create_simple_s1_embed(symbol, current_s1_signals)
@@ -1719,7 +2321,7 @@ async def check_symbol(ctx, symbol: str):
                 msg += f"\n\n除外されたセットアップ:\n" + "\n".join(excluded_setups[:10])
                 if len(excluded_setups) > 10:
                     msg += f"\n...他{len(excluded_setups)-10}個"
-            msg += history_info
+            msg += history_info + db_history_info
             await ctx.send(msg)
             
     except Exception as e:
@@ -1731,12 +2333,57 @@ async def check_symbol(ctx, symbol: str):
 @bot.command(name="clear_cache")
 @commands.has_permissions(administrator=True)
 async def clear_cache(ctx):
-    """キャッシュをクリア（管理者のみ）"""
-    global data_cache
-    cache_size = len(data_cache)
-    data_cache.clear()
-    HWBAnalyzer.get_cached_stock_data.cache_clear()  # LRUキャッシュもクリア
-    await ctx.send(f"✅ キャッシュをクリアしました（{cache_size}件）")
+    """データベースキャッシュをクリア（管理者のみ）"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            
+            # 各テーブルのレコード数を取得
+            cursor.execute("SELECT COUNT(*) FROM daily_data")
+            daily_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM weekly_data")
+            weekly_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM rule2_setups")
+            setup_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM rule3_fvgs")
+            fvg_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM rule4_breakouts")
+            breakout_count = cursor.fetchone()[0]
+            
+            # データを削除
+            cursor.execute("DELETE FROM daily_data")
+            cursor.execute("DELETE FROM weekly_data")
+            cursor.execute("DELETE FROM rule2_setups")
+            cursor.execute("DELETE FROM rule3_fvgs")
+            cursor.execute("DELETE FROM rule4_breakouts")
+            cursor.execute("DELETE FROM metadata")
+            
+            conn.commit()
+        
+        embed = discord.Embed(
+            title="✅ データベースキャッシュをクリアしました",
+            color=discord.Color.green()
+        )
+        
+        embed.add_field(
+            name="削除された株価データ",
+            value=f"日足: {daily_count:,}件\n週足: {weekly_count:,}件",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="削除されたHWB戦略データ",
+            value=f"セットアップ: {setup_count:,}件\nFVG: {fvg_count:,}件\nブレイクアウト: {breakout_count:,}件",
+            inline=True
+        )
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"❌ エラーが発生しました: {e}")
 
 
 @bot.command(name="clear_history")
@@ -1895,6 +2542,142 @@ async def toggle_alerts(ctx, alert_type: str = None):
         await ctx.send(f"✅ 戦略2アラートを{'ON' if POST_STRATEGY2_ALERTS else 'OFF'}にしました\n※ただし、当日シグナルは常に投稿されます")
     else:
         await ctx.send("❌ 無効なタイプです。`summary`, `s1`, `s2` のいずれかを指定してください。")
+
+
+@bot.command(name="update_symbols")
+@commands.has_permissions(administrator=True)
+async def update_symbols(ctx):
+    """Russell 3000銘柄リストを強制更新（管理者のみ）"""
+    await ctx.send("📡 Russell 3000銘柄リストを更新中...")
+    
+    try:
+        # 既存の銘柄リストをクリア
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM russell3000_symbols")
+            conn.commit()
+        
+        # 新しい銘柄リストを取得
+        global watched_symbols
+        watched_symbols = db_manager.get_russell3000_symbols()
+        
+        await ctx.send(f"✅ Russell 3000銘柄リストを更新しました\n監視銘柄数: {len(watched_symbols):,}")
+    except Exception as e:
+        await ctx.send(f"❌ エラーが発生しました: {e}")
+
+
+@bot.command(name="db_stats")
+async def db_stats(ctx):
+    """データベースの統計情報を表示"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            
+            # 各テーブルのレコード数
+            cursor.execute("SELECT COUNT(DISTINCT symbol) FROM daily_data")
+            daily_symbols = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM daily_data")
+            daily_records = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(DISTINCT symbol) FROM weekly_data")
+            weekly_symbols = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM weekly_data")
+            weekly_records = cursor.fetchone()[0]
+            
+            # HWB戦略データの統計
+            cursor.execute("SELECT COUNT(*) FROM rule2_setups WHERE is_active = 1")
+            active_setups = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM rule3_fvgs WHERE is_broken = 0")
+            active_fvgs = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM rule4_breakouts")
+            total_breakouts = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM rule4_breakouts WHERE breakout_date = date('now')")
+            today_breakouts = cursor.fetchone()[0]
+            
+            # 最古と最新のデータ日付
+            cursor.execute("SELECT MIN(date), MAX(date) FROM daily_data")
+            date_range = cursor.fetchone()
+            
+            # データベースファイルサイズ
+            db_size = os.path.getsize(DB_PATH) / (1024 * 1024)  # MB単位
+            
+            embed = discord.Embed(
+                title="📊 データベース統計",
+                color=discord.Color.blue()
+            )
+            
+            embed.add_field(
+                name="日足データ",
+                value=f"{daily_symbols:,} 銘柄\n{daily_records:,} レコード",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="週足データ",
+                value=f"{weekly_symbols:,} 銘柄\n{weekly_records:,} レコード",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="データベースサイズ",
+                value=f"{db_size:.1f} MB",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="セットアップ (ルール②)",
+                value=f"アクティブ: {active_setups:,}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="FVG (ルール③)",
+                value=f"アクティブ: {active_fvgs:,}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="ブレイクアウト (ルール④)",
+                value=f"合計: {total_breakouts:,}\n本日: {today_breakouts}",
+                inline=True
+            )
+            
+            if date_range[0] and date_range[1]:
+                embed.add_field(
+                    name="データ期間",
+                    value=f"{date_range[0]} 〜 {date_range[1]}",
+                    inline=False
+                )
+            
+            # 最近のブレイクアウト
+            cursor.execute('''
+                SELECT symbol, breakout_date, breakout_percentage
+                FROM rule4_breakouts
+                ORDER BY breakout_date DESC, breakout_percentage DESC
+                LIMIT 5
+            ''')
+            recent_breakouts = cursor.fetchall()
+            
+            if recent_breakouts:
+                breakout_list = []
+                for symbol, date, percentage in recent_breakouts:
+                    breakout_list.append(f"{symbol}: {date} (+{percentage:.1f}%)")
+                
+                embed.add_field(
+                    name="最近のブレイクアウト",
+                    value="\n".join(breakout_list),
+                    inline=False
+                )
+            
+            await ctx.send(embed=embed)
+            
+    except Exception as e:
+        await ctx.send(f"❌ エラーが発生しました: {e}")
 
 
 # メイン実行
