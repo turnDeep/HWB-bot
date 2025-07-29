@@ -4,6 +4,14 @@
 .env.*.local
 .env.production
 
+# SQLite Database
+*.db
+*.sqlite
+*.sqlite3
+hwb_cache.db
+hwb_cache.db-journal
+hwb_cache.db-wal
+
 # Python
 __pycache__/
 *.py[cod]
@@ -60,11 +68,6 @@ fvg_charts/
 temp/
 tmp/
 cache/
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
 
 # Backup files
 *.bak
